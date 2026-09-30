@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 description = "Staged source provenance and license policy checks"
+license = "MIT"
 publish = false
 
 [dependencies]
@@ -20,4 +21,3 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 tempfile = "3"
 
 [dev-dependencies]
-

@@ -1,18 +1,39 @@
 # oss-provenance
 
-A Rust CLI that scans staged source fingerprints with SCANOSS, checks matches against an explicitly admitted license policy, and prepares third-party notices. A match is evidence to investigate, not an accusation of plagiarism. A negative search is limited to the scanner's corpus and algorithm.
+A Rust CLI for checking staged code against known open-source code before a commit. It uses SCANOSS fingerprints to find potential reuse, checks verified source evidence against your project's approved license policy, and prepares notices that record where and how you use that code.
+
+Use it from a pre-commit hook, CI, or a coding agent. It reads the Git index, so partially staged files are checked as they'll be committed.
+
+## Current status
+
+The core scanner, policy checks, and notice proposals are implemented. License compatibility requires explicit maintainer-approved rules for your project and use context. Agent rewriting currently produces a handoff for a fresh session; it doesn't launch Claude or Codex or automatically retry a rewrite.
+
+A source match needs investigation, and a negative search is limited to the scanner's corpus and algorithm. This tool cannot prove original authorship or detect every copied hunk.
+
+## How it works
+
+1. Read staged files and identify added line ranges.
+2. Send source fingerprints to the configured SCANOSS service and check matches overlapping those additions.
+3. Verify matched source against a pinned upstream revision and apply your approved license rules.
+4. For allowed reuse, prepare a `LICENSE-NOTICES/` patch with source attribution and local uses. Existing entries gain additional uses.
+5. Block denied licenses, unresolved evidence, missing notices, and violated source-header requirements. For blocked matches, prepare an independent-requirements handoff when requested.
+
+Notice patches remain reviewable proposals: you apply and stage them, then rerun the check. License names reported by the scanner never grant permission on their own.
 
 The native fingerprint implementation is tested against the official reference. Python is not required at runtime. See [backend verification](docs/backend-contract.md).
 
-## Build
+## Install from source
+
+Install Git, then install Rust with rustup. Clone and build:
 
 ```sh
-cargo build --locked --release
+git clone https://github.com/cristim/oss-provenance.git
+cd oss-provenance
 cargo install --locked --path .
-make verify
+oss-provenance --help
 ```
 
-Rust 1.98.0 is pinned. The tool is not published and its own distribution license has not been selected. The adapted SCANOSS fingerprint code and bundled reference retain their MIT notices in `LICENSE-NOTICES/scanoss-winnowing/`.
+Rust 1.98.0 is pinned by `rust-toolchain.toml`. Python isn't required at runtime. Run the project commands below from the repository you want to check, or pass `--repo /path/to/project` before the subcommand.
 
 ## Enroll a project explicitly
 
@@ -113,3 +134,16 @@ repos:
 ```
 
 Run the same gate in CI using a pinned checker installation and protected policy SHA. Do not install or execute the checker from untrusted PR contents in a privileged job. The workflow in this tool's repository tests its Rust code; consuming projects must add their own provenance gate and trusted baseline selection. No hooks are installed automatically.
+
+## Development
+
+```sh
+make verify
+cargo build --locked --release
+```
+
+`make verify` runs formatting, Clippy, and offline tests. `make live` runs opt-in network checks using the bundled public MIT reference fixture. See [verification details](docs/verification.md) and [known limitations](known-issues.md).
+
+## License
+
+Licensed under the [MIT License](LICENSE). The adapted SCANOSS fingerprint implementation and bundled reference retain their [MIT license and attribution](LICENSE-NOTICES/scanoss-winnowing/README.md). The crate is not published to crates.io.
