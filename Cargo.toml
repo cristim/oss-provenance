@@ -1,0 +1,23 @@
+[package]
+name = "oss-provenance"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Staged source provenance and license policy checks"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9"
+sha2 = "0.10"
+md-5 = "0.10"
+crc32c = "0.6"
+spdx = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+tempfile = "3"
+
+[dev-dependencies]
+
