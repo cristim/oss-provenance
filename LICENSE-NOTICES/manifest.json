@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "e345b511a70175a0514bf95ab3a904de4f61b6fa43635fa1f93707205e5bff71",
+      "evidence": {
+        "file_md5": "d58d9e6aad6a8574050df90430ed8ffc",
+        "source_sha256": "ec606d89ddd0d2d49c193cf74147e7806ee68a573a9865cf714bf586bea9e0d5",
+        "repository": "https://github.com/scanoss/scanoss.py",
+        "revision": "0c1292bd4d53bc504804411dd42ff1ab0fa7aa76",
+        "path": "src/scanoss/winnowing.py",
+        "license": "MIT",
+        "selected_license": "MIT",
+        "review": "The pinned source embeds the MIT grant and Copyright (c) 2021, SCANOSS. The complete copyright, permission, and warranty text is retained in LICENSE-NOTICES/scanoss-winnowing/LICENSE and the unmodified upstream source. This MIT-licensed Rust CLI adapts the winnowing loop and bundles the original Python source as a development reference and test fixture; it does not execute that Python file. Preserve these artifacts in distributed source and package artifacts. The reviewed MIT grant requires retention of its copyright and permission notice; no additional source-prefix condition is imposed by this grant.",
+        "obligations": {
+          "kind": "artifact_only"
+        },
+        "artifacts": [
+          {
+            "path": "LICENSE-NOTICES/scanoss-winnowing/LICENSE",
+            "sha256": "bb42ef82d9a941c2fed842bfbfed63c0fad3e34889d49d3f7816ba968d3e16d9"
+          },
+          {
+            "path": "LICENSE-NOTICES/scanoss-winnowing/winnowing.py",
+            "sha256": "ec606d89ddd0d2d49c193cf74147e7806ee68a573a9865cf714bf586bea9e0d5"
+          }
+        ]
+      },
+      "uses": [
+        {
+          "path": "LICENSE-NOTICES/scanoss-winnowing/winnowing.py",
+          "start": 454,
+          "end": 568,
+          "snippet_sha256": "be4ed66bf37ee7746f64a20d22efb51e5d0adfd73cdabb6d553ca6242792d554",
+          "description": "Unmodified upstream wfp_for_contents implementation retained as a development reference and public test fixture. The entire bundled file is also protected by its evidence-artifact hash, including its original MIT header.",
+          "retired": false
+        },
+        {
+          "path": "src/fingerprint.rs",
+          "start": 58,
+          "end": 94,
+          "snippet_sha256": "da1b750c51a1645225a692b4cf9ac3cbfd02bebda460434a9109505e20280718",
+          "description": "Rust adaptation of the upstream winnowing loop: normalize alphanumeric bytes, maintain 30-byte grams and a 64-hash window, select minimum CRC32C values, and emit line-associated fingerprints. The recorded span covers the algorithm body independently of surrounding setup or tests.",
+          "retired": false
+        }
+      ]
+    }
+  ]
+}

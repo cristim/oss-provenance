@@ -1,0 +1,53 @@
+version = 1
+project_license = "MIT"
+use_context = "MIT-licensed Rust CLI distributed as source and binaries; retained upstream copyright and permission notices accompany reused source."
+allow = ["MIT"]
+deny = []
+exclude = [
+    ".oss-provenance.toml",
+    ".editorconfig",
+    ".github/workflows/ci.yml",
+    ".gitignore",
+    ".pre-commit-config.yaml",
+    ".pre-commit-hooks.yaml",
+    "CLAUDE.md",
+    "Cargo.lock",
+    "Cargo.toml",
+    "LICENSE",
+    "LICENSE-NOTICES/",
+    "Makefile",
+    "README.md",
+    "docs/",
+    "known-issues.md",
+    "rust-toolchain.toml",
+    "tests/fixtures/scanoss/hosted-public-response.json",
+    "tests/fixtures/scanoss/hosted-public-snippet-response.json",
+    "tests/fixtures/scanoss/oracle.json",
+]
+retirements = []
+
+[scanner]
+endpoint = "https://api.osskb.org/scan/direct"
+enabled = true
+timeout_secs = 30
+
+[[evidence]]
+file_md5 = "d58d9e6aad6a8574050df90430ed8ffc"
+source_sha256 = "ec606d89ddd0d2d49c193cf74147e7806ee68a573a9865cf714bf586bea9e0d5"
+repository = "https://github.com/scanoss/scanoss.py"
+revision = "0c1292bd4d53bc504804411dd42ff1ab0fa7aa76"
+path = "src/scanoss/winnowing.py"
+license = "MIT"
+selected_license = "MIT"
+review = "The pinned source embeds the MIT grant and Copyright (c) 2021, SCANOSS. The complete copyright, permission, and warranty text is retained in LICENSE-NOTICES/scanoss-winnowing/LICENSE and the unmodified upstream source. This MIT-licensed Rust CLI adapts the winnowing loop and bundles the original Python source as a development reference and test fixture; it does not execute that Python file. Preserve these artifacts in distributed source and package artifacts. The reviewed MIT grant requires retention of its copyright and permission notice; no additional source-prefix condition is imposed by this grant."
+
+[evidence.obligations]
+kind = "artifact_only"
+
+[[evidence.artifacts]]
+path = "LICENSE-NOTICES/scanoss-winnowing/LICENSE"
+sha256 = "bb42ef82d9a941c2fed842bfbfed63c0fad3e34889d49d3f7816ba968d3e16d9"
+
+[[evidence.artifacts]]
+path = "LICENSE-NOTICES/scanoss-winnowing/winnowing.py"
+sha256 = "ec606d89ddd0d2d49c193cf74147e7806ee68a573a9865cf714bf586bea9e0d5"
