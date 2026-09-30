@@ -6,6 +6,18 @@ use tempfile::TempDir;
 
 struct Repo(TempDir);
 
+fn isolated(mut command: Command) -> Command {
+    let keys: Vec<_> = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(command.get_envs().map(|(key, _)| key.to_owned()))
+        .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+        .collect();
+    for key in keys {
+        command.env_remove(key);
+    }
+    command
+}
+
 impl Repo {
     fn new() -> Self {
         let repo = Self(tempfile::tempdir().unwrap());
@@ -20,7 +32,7 @@ impl Repo {
     }
 
     fn git(&self, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = isolated(Command::new("git"))
             .arg("-C")
             .arg(self.path())
             .args([
@@ -271,7 +283,7 @@ fn unmerged_index_fails() {
     repo.git(&["checkout", "main"]);
     repo.write("source.rs", "main\n");
     repo.commit();
-    let merge = Command::new("git")
+    let merge = isolated(Command::new("git"))
         .arg("-C")
         .arg(repo.path())
         .args(["-c", "core.hooksPath=/dev/null", "merge", "other"])
@@ -317,7 +329,7 @@ fn non_utf8_paths_fail_explicitly() {
     let oid = repo.git(&["rev-parse", "HEAD:source.rs"]);
     let mut entry = format!("100644 {oid}\t").into_bytes();
     entry.extend_from_slice(b"invalid-\xff.rs\0");
-    let mut child = Command::new("git")
+    let mut child = isolated(Command::new("git"))
         .arg("-C")
         .arg(repo.path())
         .args([

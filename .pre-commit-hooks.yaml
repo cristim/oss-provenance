@@ -1,0 +1,7 @@
+- id: oss-provenance
+  name: Check staged source provenance
+  entry: oss-provenance check --staged
+  language: rust
+  pass_filenames: false
+  always_run: true
+  require_serial: true

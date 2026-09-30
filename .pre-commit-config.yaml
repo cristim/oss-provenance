@@ -1,0 +1,18 @@
+repos:
+  - repo: local
+    hooks:
+      - id: rust-format
+        name: Rust format
+        entry: cargo fmt --check
+        language: system
+        pass_filenames: false
+      - id: rust-clippy
+        name: Rust clippy
+        entry: cargo clippy --locked --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+      - id: rust-test
+        name: Rust tests
+        entry: env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR -u GIT_PREFIX -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_SHALLOW_FILE -u GIT_CONFIG -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT -u GIT_IMPLICIT_WORK_TREE -u GIT_GRAFT_FILE -u GIT_NO_REPLACE_OBJECTS -u GIT_REPLACE_REF_BASE cargo test --locked
+        language: system
+        pass_filenames: false
