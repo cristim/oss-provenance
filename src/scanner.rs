@@ -32,6 +32,8 @@ pub struct ScanResult {
 pub struct Scanner {
     endpoint: reqwest::Url,
     client: Client,
+    timeout: Duration,
+    cache: crate::cache::Cache,
 }
 
 impl Scanner {
@@ -61,20 +63,27 @@ impl Scanner {
             (1..=300).contains(&timeout_secs),
             "scanner timeout must be 1..300 seconds"
         );
+        let timeout = Duration::from_secs(timeout_secs);
         let client = Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
+            .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("oss-provenance/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        Ok(Self { endpoint, client })
+        Ok(Self {
+            endpoint,
+            client,
+            timeout,
+            cache: crate::cache::Cache::from_env()?,
+        })
     }
 
-    pub fn scan(&self, id: &str, bytes: &[u8]) -> Result<ScanResult> {
+    pub fn scan(&self, _id: &str, bytes: &[u8]) -> Result<ScanResult> {
         ensure!(
             bytes.len() <= 16 * 1024 * 1024,
             "input exceeds scanner's 16 MiB limit"
         );
-        let wire_id = format!("source_{:x}", Sha256::digest(id.as_bytes()));
+        let content_hash = Sha256::digest(bytes);
+        let wire_id = format!("source_{content_hash:x}");
         let fp = fingerprint(&wire_id, bytes)?;
         let fingerprintable =
             fp.snippet_count > 0 && std::str::from_utf8(bytes).is_ok() && !bytes.contains(&0);
@@ -88,35 +97,161 @@ impl Scanner {
             fp.wfp.len() <= MAX_WFP_BYTES,
             "fingerprint exceeds 64 KiB; refusing a partial scan"
         );
-        let form = multipart::Form::new()
-            .text("format", "plain")
-            .part("file", multipart::Part::text(fp.wfp).file_name("scan.wfp"));
-        let response = self
-            .client
-            .post(self.endpoint.clone())
-            .multipart(form)
-            .send()
-            .context("SCANOSS request failed")?;
-        ensure!(
-            response.status().is_success(),
-            "SCANOSS returned HTTP {}",
-            response.status()
-        );
-        let mut body = Vec::new();
-        response
-            .take(MAX_RESPONSE_BYTES + 1)
-            .read_to_end(&mut body)
-            .context("reading SCANOSS response")?;
-        ensure!(
-            body.len() as u64 <= MAX_RESPONSE_BYTES,
-            "SCANOSS response exceeds 4 MiB"
-        );
+        let key =
+            crate::cache::key(&[b"scanner", self.endpoint.as_str().as_bytes(), &content_hash]);
+        if let Some(body) =
+            self.cache
+                .load(&key, Some(Duration::from_secs(3600)), MAX_RESPONSE_BYTES)?
+            && let Ok(candidates) = parse_response(&body, &wire_id, fp.line_count)
+        {
+            return Ok(ScanResult {
+                fingerprintable,
+                candidates,
+            });
+        }
+        let body = self.request(&fp.wfp).context(
+            "SCANOSS verification unavailable; pause verification and retry later without rewriting code or consuming repair budget",
+        )?;
         let candidates = parse_response(&body, &wire_id, fp.line_count)?;
+        self.cache.store(&key, &body)?;
         Ok(ScanResult {
             fingerprintable,
             candidates,
         })
     }
+
+    fn request(&self, wfp: &str) -> Result<Vec<u8>> {
+        let deadline = std::time::Instant::now() + self.timeout;
+        for attempt in 0..3 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            ensure!(
+                !remaining.is_zero(),
+                "SCANOSS total request timeout exhausted"
+            );
+            let form = multipart::Form::new().text("format", "plain").part(
+                "file",
+                multipart::Part::text(wfp.to_owned()).file_name("scan.wfp"),
+            );
+            let response = self
+                .client
+                .post(self.endpoint.clone())
+                .timeout(remaining)
+                .multipart(form)
+                .send();
+            let (error, delay) = match response {
+                Err(error) => {
+                    if !error.is_connect() && !error.is_timeout() {
+                        return Err(error).context("SCANOSS request failed");
+                    }
+                    (
+                        anyhow::Error::new(error).context("SCANOSS request failed"),
+                        Duration::from_secs(1 << attempt),
+                    )
+                }
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        let mut body = Vec::new();
+                        match response.take(MAX_RESPONSE_BYTES + 1).read_to_end(&mut body) {
+                            Ok(_) => {
+                                ensure!(
+                                    std::time::Instant::now() < deadline,
+                                    "SCANOSS total request timeout exhausted while reading response"
+                                );
+                                ensure!(
+                                    body.len() as u64 <= MAX_RESPONSE_BYTES,
+                                    "SCANOSS response exceeds 4 MiB"
+                                );
+                                return Ok(body);
+                            }
+                            Err(error) => {
+                                if !body_timeout(&error) {
+                                    return Err(error).context("reading SCANOSS response");
+                                }
+                                (
+                                    anyhow::Error::new(error)
+                                        .context("reading SCANOSS response timed out"),
+                                    Duration::from_secs(1 << attempt),
+                                )
+                            }
+                        }
+                    } else {
+                        let description = match status.as_u16() {
+                            429 => "rate limited",
+                            502..=504 => "temporarily unavailable",
+                            _ => "request rejected",
+                        };
+                        let error = anyhow::anyhow!("SCANOSS {description}: HTTP {status}");
+                        if !matches!(status.as_u16(), 429 | 502 | 503 | 504) {
+                            return Err(error);
+                        }
+                        let delay = retry_delay(response.headers(), attempt)
+                            .with_context(|| format!("SCANOSS {description}: HTTP {status}"))?;
+                        (error, delay)
+                    }
+                }
+            };
+            if attempt == 2 {
+                return Err(error).context("SCANOSS failed after 3 attempts");
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if delay >= remaining {
+                return Err(error).context(format!("SCANOSS retry delay of at least {} seconds exceeds the remaining total timeout; no early retry was sent", delay.as_secs_f64()));
+            }
+            std::thread::sleep(delay);
+        }
+        unreachable!()
+    }
+}
+
+fn retry_delay(headers: &reqwest::header::HeaderMap, attempt: u32) -> Result<Duration> {
+    let fallback = Duration::from_secs(1 << attempt);
+    let Some(header) = headers.get(reqwest::header::RETRY_AFTER) else {
+        return Ok(fallback);
+    };
+    ensure!(
+        headers.get_all(reqwest::header::RETRY_AFTER).iter().count() == 1,
+        "SCANOSS returned multiple Retry-After headers; retry blocked"
+    );
+    let value = header
+        .to_str()
+        .context("SCANOSS returned an invalid Retry-After header; retry blocked")?
+        .trim();
+    let delay = if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        Duration::from_secs(
+            value
+                .parse::<u64>()
+                .context("SCANOSS Retry-After delay is out of range; retry blocked")?,
+        )
+    } else {
+        let date = httpdate::parse_http_date(value)
+            .context("SCANOSS returned an invalid Retry-After header; retry blocked")?;
+        date.duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO)
+    };
+    Ok(delay.max(fallback))
+}
+
+fn body_timeout(error: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(error) = error.downcast_ref::<reqwest::Error>()
+        && error.is_timeout()
+    {
+        return true;
+    }
+    if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            return true;
+        }
+        if let Some(inner) = error.get_ref()
+            && body_timeout(inner)
+        {
+            return true;
+        }
+    }
+    error.source().is_some_and(body_timeout)
 }
 
 fn parse_response(body: &[u8], expected_id: &str, line_count: usize) -> Result<Vec<Candidate>> {
@@ -471,24 +606,23 @@ mod tests {
 
     #[test]
     fn actual_http_multipart_preserves_identity_and_reports_coverage() {
-        let wire_id = format!("source_{:x}", Sha256::digest(b"src/private-name.rs"));
-        let body = serde_json::json!({wire_id.clone():[{"id":"none"}]}).to_string();
         let source = b"fn example(value: u64) -> u64 { value + 17 }\n".repeat(30);
-        let (result, sent) = request("200 OK", body.clone(), &source);
-        assert!(result.unwrap().fingerprintable);
-        assert!(sent.starts_with("POST /scan HTTP/1.1"));
-        assert!(sent.contains("name=\"file\"; filename=\"scan.wfp\""));
-        assert!(sent.contains(&wire_id));
-        assert!(!sent.contains("private-name"));
-        assert!(!sent.contains("fn example"));
-        assert!(
-            !request("200 OK", body.clone(), b"short")
-                .0
-                .unwrap()
-                .fingerprintable
-        );
         let binary = [source.as_slice(), &[0]].concat();
-        assert!(!request("200 OK", body, &binary).0.unwrap().fingerprintable);
+        for (input, fingerprintable) in [
+            (source.as_slice(), true),
+            (b"short".as_slice(), false),
+            (binary.as_slice(), false),
+        ] {
+            let wire_id = format!("source_{:x}", Sha256::digest(input));
+            let body = serde_json::json!({wire_id.clone():[{"id":"none"}]}).to_string();
+            let (result, sent) = request("200 OK", body, input);
+            assert_eq!(result.unwrap().fingerprintable, fingerprintable);
+            assert!(sent.starts_with("POST /scan HTTP/1.1"));
+            assert!(sent.contains("name=\"file\"; filename=\"scan.wfp\""));
+            assert!(sent.contains(&wire_id));
+            assert!(!sent.contains("private-name"));
+            assert!(!sent.contains("fn example"));
+        }
     }
 
     #[test]
@@ -501,5 +635,364 @@ mod tests {
         ] {
             assert!(request(status, body.to_owned(), b"short").0.is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_retry_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn no_match(input: &[u8]) -> String {
+        format!(
+            r#"{{"source_{:x}":[{{"id":"none"}}]}}"#,
+            Sha256::digest(input)
+        )
+    }
+
+    struct Server {
+        done: std::sync::mpsc::Sender<()>,
+        thread: thread::JoinHandle<Vec<String>>,
+    }
+
+    impl Server {
+        fn join(self) -> thread::Result<Vec<String>> {
+            let _ = self.done.send(());
+            self.thread.join()
+        }
+    }
+
+    fn server(responses: Vec<String>) -> (reqwest::Url, Server) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/scan", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (done, stopped) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(12);
+            let mut requests = Vec::new();
+            loop {
+                let mut stream = loop {
+                    if stopped.try_recv() != Err(std::sync::mpsc::TryRecvError::Empty) {
+                        return requests;
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "missing expected HTTP request"
+                            );
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let count = stream.read(&mut buf).unwrap();
+                    assert!(count > 0, "truncated request");
+                    request.extend_from_slice(&buf[..count]);
+                    if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&request[..end]);
+                        let length = header
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let reply = responses
+                    .get(requests.len())
+                    .cloned()
+                    .unwrap_or_else(|| response("500 Unexpected Request", "", ""));
+                requests.push(String::from_utf8(request).unwrap());
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        (
+            endpoint,
+            Server {
+                done,
+                thread: handle,
+            },
+        )
+    }
+
+    fn response(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn scanner(endpoint: reqwest::Url, root: &std::path::Path) -> Scanner {
+        let mut scanner = Scanner::with_url(endpoint, 10).unwrap();
+        scanner.cache = crate::cache::Cache::at(root.to_owned()).unwrap();
+        scanner
+    }
+
+    #[test]
+    fn fixture_reads_fragmented_request_bodies() {
+        let (endpoint, requests) = server(vec![response("200 OK", "", "")]);
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", endpoint.port().unwrap())).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .write_all(b"POST /scan HTTP/1.1\r\nContent-Length: 4\r\n\r\nab")
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        stream.write_all(b"cd").unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200 OK"));
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].ends_with("\r\n\r\nabcd"));
+    }
+
+    #[test]
+    fn cached_response_reuses_content_after_rename_without_refresh() {
+        let input = b"source bytes for rename";
+        let (endpoint, requests) = server(vec![response("200 OK", "", &no_match(input))]);
+        let directory = tempfile::tempdir().unwrap();
+        let scanner = scanner(endpoint, directory.path());
+        scanner.scan("private/old.rs", input).unwrap();
+        let path = std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut before = std::fs::read(&path).unwrap();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 10;
+        before[10..18].copy_from_slice(&stamp.to_be_bytes());
+        std::fs::write(&path, &before).unwrap();
+        scanner.scan("private/new.rs", input).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].contains("private/"));
+        assert!(requests[0].contains(&format!("source_{:x}", Sha256::digest(input))));
+    }
+
+    #[test]
+    fn changed_content_and_endpoint_require_requests() {
+        let first = b"first source";
+        let second = b"second source";
+        let (endpoint, requests) = server(vec![
+            response("200 OK", "", &no_match(first)),
+            response("200 OK", "", &no_match(second)),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let scanner_a = scanner(endpoint, directory.path());
+        scanner_a.scan("same.rs", first).unwrap();
+        scanner_a.scan("same.rs", second).unwrap();
+        assert_eq!(requests.join().unwrap().len(), 2);
+        let (endpoint, requests) = server(vec![response("200 OK", "", &no_match(first))]);
+        scanner(endpoint, directory.path())
+            .scan("same.rs", first)
+            .unwrap();
+        assert_eq!(requests.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn corrupt_expired_and_invalid_json_cache_require_fresh_requests() {
+        let input = b"cache invalidation";
+        let (endpoint, requests) = server(vec![response("200 OK", "", &no_match(input)); 4]);
+        let directory = tempfile::tempdir().unwrap();
+        let scanner = scanner(endpoint, directory.path());
+        scanner.scan("source.rs", input).unwrap();
+        let path = std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(&path, b"broken record").unwrap();
+        scanner.scan("source.rs", input).unwrap();
+        let mut record = std::fs::read(&path).unwrap();
+        record[10..18].copy_from_slice(&0_u64.to_be_bytes());
+        std::fs::write(&path, record).unwrap();
+        scanner.scan("source.rs", input).unwrap();
+        let key = path.file_name().unwrap().to_str().unwrap();
+        scanner.cache.store(key, b"not JSON").unwrap();
+        scanner.scan("source.rs", input).unwrap();
+        assert_eq!(requests.join().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn transient_statuses_retry_and_success_is_cached() {
+        let input = b"retry source";
+        let (endpoint, requests) = server(vec![
+            response("429 Too Many Requests", "Retry-After: 0\r\n", ""),
+            response("503 Service Unavailable", "", ""),
+            response("200 OK", "", &no_match(input)),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let scanner = scanner(endpoint, directory.path());
+        scanner.scan("source.rs", input).unwrap();
+        scanner.scan("renamed.rs", input).unwrap();
+        assert_eq!(requests.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn malformed_and_long_retry_after_block_without_an_early_retry() {
+        for header in ["invalid", "100", "18446744073709551616"] {
+            let (endpoint, requests) = server(vec![response(
+                "429 Too Many Requests",
+                &format!("Retry-After: {header}\r\n"),
+                "",
+            )]);
+            let directory = tempfile::tempdir().unwrap();
+            let started = std::time::Instant::now();
+            let error = scanner(endpoint, directory.path())
+                .scan("source.rs", b"input")
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("retry"));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(requests.join().unwrap().len(), 1);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn malformed_live_response_is_never_cached() {
+        let (endpoint, requests) = server(vec![response("200 OK", "", "not JSON"); 2]);
+        let directory = tempfile::tempdir().unwrap();
+        let scanner = scanner(endpoint, directory.path());
+        assert!(scanner.scan("source.rs", b"input").is_err());
+        assert!(scanner.scan("source.rs", b"input").is_err());
+        assert_eq!(requests.join().unwrap().len(), 2);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn retry_after_http_date_respects_server_minimum() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let date = std::time::SystemTime::now() + Duration::from_secs(30);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            httpdate::fmt_http_date(date).parse().unwrap(),
+        );
+        assert!(retry_delay(&headers, 0).unwrap() >= Duration::from_secs(28));
+        headers.insert(reqwest::header::RETRY_AFTER, "2".parse().unwrap());
+        assert_eq!(retry_delay(&headers, 0).unwrap(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn retries_share_one_total_timeout() {
+        let (endpoint, requests) = server(vec![response("503 Service Unavailable", "", ""); 2]);
+        let directory = tempfile::tempdir().unwrap();
+        let mut scanner = scanner(endpoint, directory.path());
+        scanner.timeout = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let error = scanner.scan("source.rs", b"input").unwrap_err();
+        assert!(format!("{error:#}").contains("remaining total timeout"));
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(requests.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn stalled_response_body_is_bounded_by_total_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/scan", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            thread::sleep(Duration::from_secs(3));
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut scanner = scanner(endpoint, directory.path());
+        scanner.timeout = Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let error = scanner.scan("source.rs", b"input").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("timeout") || format!("{error:#}").contains("timed out")
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn permanent_statuses_are_not_retried() {
+        for status in ["400 Bad Request", "403 Forbidden", "302 Found"] {
+            let (endpoint, requests) = server(vec![response(status, "", "")]);
+            let directory = tempfile::tempdir().unwrap();
+            assert!(
+                scanner(endpoint, directory.path())
+                    .scan("source.rs", b"input")
+                    .is_err()
+            );
+            assert_eq!(requests.join().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn retry_exhaustion_distinguishes_rate_limit_from_outage() {
+        for (status, expected) in [
+            ("429 Too Many Requests", "rate limited"),
+            ("503 Service Unavailable", "temporarily unavailable"),
+        ] {
+            let (endpoint, requests) = server(vec![response(status, "", ""); 3]);
+            let directory = tempfile::tempdir().unwrap();
+            let error = scanner(endpoint, directory.path())
+                .scan("source.rs", b"input")
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains(expected));
+            assert!(error.contains("failed after 3 attempts"));
+            assert!(error.contains("pause verification"));
+            assert!(error.contains("without rewriting code or consuming repair budget"));
+            assert_eq!(requests.join().unwrap().len(), 3);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn body_timeout_classifies_nested_io_errors_without_text_matching() {
+        let timeout =
+            std::io::Error::other(std::io::Error::new(std::io::ErrorKind::TimedOut, "elapsed"));
+        assert!(body_timeout(&timeout));
+        assert!(!body_timeout(&std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "timeout"
+        )));
     }
 }

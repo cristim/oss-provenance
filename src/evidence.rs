@@ -273,6 +273,20 @@ pub fn collect(candidate: &Candidate, timeout_secs: u64) -> Result<Proposal> {
 }
 
 pub fn verify_source(evidence: &Evidence, timeout_secs: u64) -> Result<Vec<u8>> {
+    verify_source_with_cache(
+        evidence,
+        timeout_secs,
+        &crate::cache::Cache::from_env()?,
+        |mut download, url| download.get(url),
+    )
+}
+
+fn verify_source_with_cache(
+    evidence: &Evidence,
+    timeout_secs: u64,
+    cache: &crate::cache::Cache,
+    fetch: impl FnOnce(Download, Url) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
     ensure!(
         hex_hash(&evidence.revision, 40),
         "source verification requires a full GitHub commit hash"
@@ -289,9 +303,22 @@ pub fn verify_source(evidence: &Evidence, timeout_secs: u64) -> Result<Vec<u8>> 
     )?;
     let mut rest = vec![evidence.revision.as_str()];
     rest.extend(evidence.path.split('/'));
-    let bytes =
-        Download::new(timeout_secs)?.get(identity.url("raw.githubusercontent.com", &rest)?)?;
+    let url = identity.url("raw.githubusercontent.com", &rest)?;
+    let download = Download::new(timeout_secs)?;
+    let key = crate::cache::key(&[
+        b"source",
+        url.as_str().as_bytes(),
+        evidence.source_sha256.as_bytes(),
+        evidence.file_md5.as_bytes(),
+    ]);
+    if let Some(bytes) = cache.load(&key, None, MAX_RESPONSE)?
+        && verify_admitted_source(&bytes, evidence).is_ok()
+    {
+        return Ok(bytes);
+    }
+    let bytes = fetch(download, url)?;
     verify_admitted_source(&bytes, evidence)?;
+    cache.store(&key, &bytes)?;
     Ok(bytes)
 }
 
@@ -541,6 +568,149 @@ fn scancode_expressions(
         "ScanCode report does not cover every collected upstream artifact"
     );
     Ok(expressions)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    const SOURCE: &[u8] = include_bytes!("../LICENSE-NOTICES/scanoss-winnowing/winnowing.py");
+
+    fn evidence() -> Evidence {
+        Evidence {
+            file_md5: format!("{:x}", Md5::digest(SOURCE)),
+            source_sha256: policy::sha256(SOURCE),
+            repository: "https://github.com/scanoss/scanoss.py".into(),
+            revision: "0c1292bd4d53bc504804411dd42ff1ab0fa7aa76".into(),
+            path: "src/scanoss/winnowing.py".into(),
+            license: "MIT".into(),
+            selected_license: "MIT".into(),
+            review: "test fixture".into(),
+            obligations: Obligations::ArtifactOnly {},
+            artifacts: vec![],
+        }
+    }
+
+    fn key(evidence: &Evidence) -> String {
+        let url = format!(
+            "https://raw.githubusercontent.com/scanoss/scanoss.py/{}/{}",
+            evidence.revision, evidence.path
+        );
+        crate::cache::key(&[
+            b"source",
+            url.as_bytes(),
+            evidence.source_sha256.as_bytes(),
+            evidence.file_md5.as_bytes(),
+        ])
+    }
+
+    #[test]
+    fn immutable_source_hit_rechecks_hashes_without_fetch_or_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = crate::cache::Cache::at(directory.path().to_owned()).unwrap();
+        let evidence = evidence();
+        let key = key(&evidence);
+        cache.store(&key, SOURCE).unwrap();
+        let mut before = std::fs::read(directory.path().join(&key)).unwrap();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 10;
+        before[10..18].copy_from_slice(&stamp.to_be_bytes());
+        std::fs::write(directory.path().join(&key), &before).unwrap();
+        let bytes = verify_source_with_cache(&evidence, 5, &cache, |_, _| {
+            panic!("cache hit fetched source")
+        })
+        .unwrap();
+        assert_eq!(bytes, SOURCE);
+        assert_eq!(std::fs::read(directory.path().join(key)).unwrap(), before);
+    }
+
+    #[test]
+    fn poisoned_source_cache_requires_valid_fresh_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = crate::cache::Cache::at(directory.path().to_owned()).unwrap();
+        let evidence = evidence();
+        let key = key(&evidence);
+        cache.store(&key, b"poisoned source").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let bytes = verify_source_with_cache(&evidence, 5, &cache, |_, url| {
+            calls.set(calls.get() + 1);
+            assert_eq!(url.as_str(), "https://raw.githubusercontent.com/scanoss/scanoss.py/0c1292bd4d53bc504804411dd42ff1ab0fa7aa76/src/scanoss/winnowing.py");
+            Ok(SOURCE.to_vec())
+        }).unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(bytes, SOURCE);
+        assert_eq!(
+            cache.load(&key, None, MAX_RESPONSE).unwrap().unwrap(),
+            SOURCE
+        );
+        cache.store(&key, b"poisoned source").unwrap();
+        let error = verify_source_with_cache(&evidence, 5, &cache, |_, _| {
+            anyhow::bail!("upstream unavailable")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("upstream unavailable"));
+        assert!(
+            verify_source_with_cache(&evidence, 5, &cache, |_, _| Ok(b"bad live source".to_vec()))
+                .is_err()
+        );
+        assert_eq!(
+            cache.load(&key, None, MAX_RESPONSE).unwrap().unwrap(),
+            b"poisoned source"
+        );
+    }
+
+    #[test]
+    fn cached_bytes_must_match_both_admitted_hashes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = crate::cache::Cache::at(directory.path().to_owned()).unwrap();
+        let mut bad_sha = evidence();
+        bad_sha.source_sha256 = "0".repeat(64);
+        let mut bad_md5 = evidence();
+        bad_md5.file_md5 = "0".repeat(32);
+        for evidence in [bad_sha, bad_md5] {
+            cache.store(&key(&evidence), SOURCE).unwrap();
+            let error = verify_source_with_cache(&evidence, 5, &cache, |_, _| {
+                anyhow::bail!("fresh verification required")
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), "fresh verification required");
+        }
+    }
+
+    #[test]
+    fn cache_cannot_bypass_origin_revision_path_or_timeout_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = crate::cache::Cache::at(directory.path().to_owned()).unwrap();
+        let original = evidence();
+        cache.store(&key(&original), SOURCE).unwrap();
+        for timeout in [0, 301] {
+            assert!(
+                verify_source_with_cache(&original, timeout, &cache, |_, _| panic!(
+                    "invalid timeout fetched"
+                ))
+                .is_err()
+            );
+        }
+        let mut bad_origin = evidence();
+        bad_origin.repository = "https://github.com.evil.invalid/scanoss/scanoss.py".into();
+        let mut bad_revision = evidence();
+        bad_revision.revision = "main".into();
+        let mut bad_path = evidence();
+        bad_path.path = "../private".into();
+        let mut bad_hash = evidence();
+        bad_hash.source_sha256 = "invalid".into();
+        for evidence in [bad_origin, bad_revision, bad_path, bad_hash] {
+            assert!(
+                verify_source_with_cache(&evidence, 5, &cache, |_, _| panic!(
+                    "invalid evidence fetched"
+                ))
+                .is_err()
+            );
+        }
+    }
 }
 
 #[cfg(test)]

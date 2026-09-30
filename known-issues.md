@@ -1,8 +1,9 @@
 # Known limitations
 
-- Automatic provider execution, sandboxed candidate tests, and bounded automatic rewrite/rescan are not implemented. Both agent options produce explicit blocked handoffs. Local API-key environment variables are absent; CLI-only isolation and authenticated generation have not been verified together.
+- Automatic provider execution, sandboxed candidate tests, and bounded automatic rewrite/rescan are not implemented in the CLI. Both agent options produce explicit blocked handoffs. A separate end-to-end demonstration used authenticated, fresh-context generation with tools disabled, sandboxed candidate tests, and the commit hook; the provider's host process was not isolated by an OS sandbox.
 - New source evidence requires human admission. The collector fetches real immutable GitHub evidence and can inspect a supplied pinned ScanCode report, but it does not run ScanCode or automatically conclude applicability.
 - GitHub is the only supported source host. Unresolvable scanner versions, modified grants, custom SPDX references, ambiguous provenance, and unsupported fuzzy source correspondence remain unresolved.
-- No scan cache is implemented. Accepted matches download pinned evidence, so service outages can block commits and large changes may be slow.
+- Caching is opt-in. Scanner responses expire after one hour; immutable source bytes are hash-checked on reuse. Mutable cached negative results require trusted storage and may miss corpus changes within that hour. No automatic eviction or disk-size limit is implemented.
+- Requests are serial per process, with bounded retries. Multiple agents do not share a rate limiter. Outages can still block commits when there is no valid cache entry; operational errors use stderr and exit 2 rather than a structured JSON error report.
 - The full-tree policy admission workflow is explicit CLI evaluation and maintainer configuration, not a protected CI promotion service.
 - There is no shipped dependency-vulnerability or coverage-threshold gate yet. Standard offline tests, format, clippy, and build checks are provided.

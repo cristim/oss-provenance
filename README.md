@@ -13,7 +13,7 @@ A source match needs investigation, and a negative search is limited to the scan
 ## How it works
 
 1. Read staged files and identify added line ranges.
-2. Send source fingerprints to the configured SCANOSS service and check matches overlapping those additions.
+2. Identify source fingerprints through the configured SCANOSS service, or a fresh local cache entry when enabled, and check matches overlapping those additions.
 3. Verify matched source against a pinned upstream revision and apply your approved license rules.
 4. For allowed reuse, prepare a `LICENSE-NOTICES/` patch with source attribution and local uses. Existing entries gain additional uses.
 5. Block denied licenses, unresolved evidence, missing notices, and violated source-header requirements. For blocked matches, prepare an independent-requirements handoff when requested.
@@ -104,6 +104,25 @@ Text reports show the project license and use context, numbered findings, local 
 
 Empty, tiny, binary, non-UTF-8, symlink, and submodule inputs cannot silently pass as scanned text. Explicit policy exclusions appear in reports. Every changed file is considered; a fingerprintable file does not guarantee detection of every tiny addition.
 
+### Reduce repeated API requests
+
+Caching is opt-in and disabled by default. To enable it for your shell and hooks launched from that shell:
+
+```sh
+export OSS_PROVENANCE_CACHE_DIR="$HOME/.cache/oss-provenance"
+oss-provenance check --staged
+```
+
+Use an absolute path in a trusted local directory. Scanner responses are cached for one hour, keyed by the endpoint, cache version, and SHA-256 of the exact source bytes. Renaming identical content can reuse a response; changing content requires a different entry. Hits do not extend the expiry time. Responses are validated again on every hit; malformed, expired, or future-dated records require a successful new request. Failed scans are never cached, and stale data is never a fallback for an unavailable service.
+
+The cache stores identification results, including negative searches, rather than license approvals. Every check still applies its admitted policy, verifies source correspondence, and checks notices for the current local paths. Cached negative results may miss corpus changes during that hour. Cache files are not authenticated: anyone who can modify them can influence identification results. Keep the directory outside candidate-controlled storage; protected CI should leave caching disabled or use storage unavailable to untrusted jobs. There is no automatic cache eviction or disk-size limit yet.
+
+Pinned upstream source bytes are cached separately and checked against the admitted SHA-256 and MD5 on every read. These immutable bytes do not expire. Local project source text is not stored in the cache. Unsetting `OSS_PROVENANCE_CACHE_DIR` bypasses both caches without deleting them.
+
+Requests remain serial within each check. Transient connection failures, timeouts, and HTTP 429/502/503/504 responses allow at most three attempts within the configured scanner timeout, including waits and response reads. Backoff is one second then two seconds; a valid `Retry-After` can require a longer wait. If that wait exceeds the remaining budget, verification stops rather than retrying early. Multiple agent processes are not coordinated by a global rate limiter.
+
+Run the check before a commit and after each candidate rewrite. On exit 2, inspect the operational error: wait and retry service failures, or fix configuration errors. Do not rewrite code or consume one of the ten rewrite attempts because the scanner is unavailable. An incomplete scan leaves the commit blocked.
+
 ## Resolve source licensing
 
 A scanner license label cannot clear a finding. The current automatic evidence collector supports public GitHub repositories. It resolves the reported version to a commit, verifies source identity, and downloads applicable grant artifacts from that revision:
@@ -117,7 +136,7 @@ The evidence proposal remains pending. A maintainer reviews grant applicability,
 
 An admitted evidence record contains `file_md5`, `source_sha256`, `repository`, full `revision`, `path`, upstream `license`, concrete `selected_license`, review rationale, and `artifacts` with repository-relative paths and SHA-256 values. The artifacts must exist in the admitted commit under `LICENSE-NOTICES/`. The selected SPDX requirements must satisfy the original grant. `allow` and `deny` contain individual requirements, not compound expressions. Compatibility rules are explicit project decisions, not a universal legal table.
 
-Accepted matches fetch and hash-check the pinned source again, then verify supported local/upstream content correspondence. Unsupported fuzzy correspondence remains unresolved. Missing evidence, custom terms, ambiguous candidates, and unavailable evidence services block clearance.
+Accepted matches hash-check the pinned source, downloading it unless verified cached bytes are available, then verify supported local/upstream content correspondence. Unsupported fuzzy correspondence remains unresolved. Missing evidence, custom terms, ambiguous candidates, and unavailable evidence services without a valid cache entry block clearance.
 
 Each evidence record requires an explicit `obligations` decision. `kind = "artifact_only"` means the reviewer determined the retained artifacts suffice for this use. `kind = "source_prefix"` additionally requires `text`, an exact leading block in every local file containing active reuse; include required source headers and modification statements there. Checks enforce it even when only a header is deleted. `kind = "unsupported"` with a `reason` blocks clearance. Collection defaults to unsupported until reviewed. Obligations outside these supported forms require review and remain blocked, rather than being inferred from a license name.
 

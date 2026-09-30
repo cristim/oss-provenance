@@ -1,3 +1,4 @@
+mod cache;
 pub mod check;
 pub mod evidence;
 pub mod fingerprint;

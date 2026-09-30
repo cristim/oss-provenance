@@ -6,10 +6,13 @@ use oss_provenance::{
     policy::{self, Artifact, Evidence, Obligations, Policy, ScannerConfig},
     scanner::{Candidate, ScanResult},
 };
+use sha2::Sha256;
 use std::{
+    collections::BTreeMap,
     fs,
     path::Path,
     process::{Command, Output},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
 
@@ -172,6 +175,77 @@ impl Fixture {
             .output()
             .unwrap()
     }
+
+    fn cli_with_cache(&self, cache: &Path, args: &[&str]) -> Output {
+        isolated(Command::new(BINARY))
+            .arg("--repo")
+            .arg(self.path())
+            .args(args)
+            .env("OSS_PROVENANCE_CACHE_DIR", cache)
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "http://127.0.0.1:1")
+            .env("NO_PROXY", "")
+            .env("http_proxy", "http://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("all_proxy", "http://127.0.0.1:1")
+            .env("no_proxy", "")
+            .output()
+            .unwrap()
+    }
+}
+
+fn seed_cache(cache: &Path, parts: &[&[u8]], body: &[u8]) {
+    let mut hash = Sha256::new();
+    hash.update(b"oss-provenance-cache-v1");
+    hash.update(env!("CARGO_PKG_VERSION").as_bytes());
+    for part in parts {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part);
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 10;
+    let mut record = b"OSSPCACHE\x01".to_vec();
+    record.extend_from_slice(&stamp.to_be_bytes());
+    record.extend_from_slice(body);
+    fs::write(cache.join(format!("{:x}", hash.finalize())), record).unwrap();
+}
+
+fn cache_bytes(cache: &Path) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(cache)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().into_string().unwrap(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn cached_check(fixture: &Fixture, cache: &Path) -> (i32, serde_json::Value) {
+    let output = fixture.cli_with_cache(
+        cache,
+        &[
+            "check",
+            "--staged",
+            "--policy-ref",
+            &fixture.reference,
+            "--format",
+            "json",
+        ],
+    );
+    let code = output.status.code().unwrap();
+    assert!(
+        matches!(code, 0 | 1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (code, serde_json::from_slice(&output.stdout).unwrap())
 }
 
 fn exit(output: &Output, expected: i32) {
@@ -298,6 +372,130 @@ fn missing_notice_then_deterministic_virtual_proposal_clears_admitted_match() {
         fs::read(fixture.path().join("source.py")).unwrap(),
         b"unstaged sentinel must not be read\n"
     );
+}
+
+#[test]
+fn cli_cached_match_still_requires_notices_and_current_policy_permission() {
+    let mut fixture = Fixture::new();
+    fixture.policy.scanner.endpoint = "https://127.0.0.1:1/scan".into();
+    fixture.policy.scanner.timeout_secs = 1;
+    fixture.policy_bytes = toml::to_string(&fixture.policy).unwrap().into_bytes();
+    fixture.stage(policy::POLICY_PATH, &fixture.policy_bytes);
+    fixture.commit();
+    fixture.reference = fixture.git(&["rev-parse", "HEAD"]);
+
+    let cache = tempfile::tempdir().unwrap();
+    let content_hash = Sha256::digest(PUBLIC_SOURCE);
+    let wire_id = format!("source_{content_hash:x}");
+    let evidence = &fixture.policy.evidence[0];
+    let scan = serde_json::json!({wire_id: [{
+        "id": "snippet",
+        "lines": "1-2",
+        "oss_lines": "1-2",
+        "url": evidence.repository,
+        "file": evidence.path,
+        "file_hash": evidence.file_md5,
+        "licenses": [{"name": "MIT"}]
+    }]});
+    seed_cache(
+        cache.path(),
+        &[
+            b"scanner",
+            fixture.policy.scanner.endpoint.as_bytes(),
+            &content_hash,
+        ],
+        &serde_json::to_vec(&scan).unwrap(),
+    );
+    let raw_url = format!(
+        "https://raw.githubusercontent.com/scanoss/scanoss.py/{}/{}",
+        evidence.revision, evidence.path
+    );
+    seed_cache(
+        cache.path(),
+        &[
+            b"source",
+            raw_url.as_bytes(),
+            evidence.source_sha256.as_bytes(),
+            evidence.file_md5.as_bytes(),
+        ],
+        PUBLIC_SOURCE,
+    );
+    let seeded = cache_bytes(cache.path());
+    assert_eq!(seeded.len(), 2);
+    fixture.stage("source.py", PUBLIC_SOURCE);
+    let (code, first) = cached_check(&fixture, cache.path());
+    assert_eq!(code, 1);
+    assert_eq!(
+        first["files"][0]["findings"][0]["status"],
+        "notice_required"
+    );
+
+    let mut manifest = notices::load(&fixture.snapshot().files).unwrap();
+    notices::upsert(
+        &mut manifest,
+        &fixture.policy.evidence[0],
+        "source.py",
+        1,
+        2,
+        PUBLIC_SOURCE,
+        "Pinned public source reuse",
+    )
+    .unwrap();
+    for (path, bytes) in notices::proposed_files(&manifest).unwrap() {
+        fixture.stage(&path, &bytes);
+    }
+    let (code, allowed) = cached_check(&fixture, cache.path());
+    assert_eq!(code, 0);
+    let source_finding = allowed["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "source.py")
+        .unwrap();
+    assert_eq!(source_finding["findings"][0]["status"], "allowed");
+
+    fixture.stage("copy.py", PUBLIC_SOURCE);
+    let (code, copy) = cached_check(&fixture, cache.path());
+    assert_eq!(code, 1);
+    let copy_finding = copy["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "copy.py")
+        .unwrap();
+    assert_eq!(copy_finding["findings"][0]["status"], "notice_required");
+
+    notices::upsert(
+        &mut manifest,
+        &fixture.policy.evidence[0],
+        "copy.py",
+        1,
+        2,
+        PUBLIC_SOURCE,
+        "Second use of pinned public source",
+    )
+    .unwrap();
+    for (path, bytes) in notices::proposed_files(&manifest).unwrap() {
+        fixture.stage(&path, &bytes);
+    }
+    fixture.commit();
+    fixture.policy.allow.clear();
+    fixture.policy.deny.push("MIT".into());
+    fixture.policy_bytes = toml::to_string(&fixture.policy).unwrap().into_bytes();
+    fixture.stage(policy::POLICY_PATH, &fixture.policy_bytes);
+    fixture.commit();
+    fixture.reference = fixture.git(&["rev-parse", "HEAD"]);
+    fixture.stage("blocked.py", PUBLIC_SOURCE);
+    let (code, denied) = cached_check(&fixture, cache.path());
+    assert_eq!(code, 1);
+    let blocked_finding = denied["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "blocked.py")
+        .unwrap();
+    assert_eq!(blocked_finding["findings"][0]["status"], "blocked");
+    assert_eq!(cache_bytes(cache.path()), seeded);
 }
 
 #[test]

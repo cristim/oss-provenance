@@ -19,5 +19,6 @@ crc32c = "0.6"
 spdx = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 tempfile = "3"
+httpdate = "1"
 
 [dev-dependencies]
