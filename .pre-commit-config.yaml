@@ -17,7 +17,7 @@ repos:
         language: system
         pass_filenames: false
   - repo: https://github.com/cristim/oss-provenance
-    rev: f0a9c0b1747eb2f0d6aba01b03b8da8db732d082
+    rev: d419302de2f2a477abdd66250c9a3c6da3dec95e
     hooks:
       - id: oss-provenance
         always_run: true
