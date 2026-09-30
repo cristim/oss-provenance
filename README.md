@@ -22,6 +22,35 @@ Notice patches remain reviewable proposals: you apply and stage them, then rerun
 
 The native fingerprint implementation is tested against the official reference. Python is not required at runtime. See [backend verification](docs/backend-contract.md).
 
+### Example: copied Linux kernel code
+
+In a disposable clone with this repository's hook and admitted policy, we staged the 81-line `sort_r` function from [Linux v6.12's `lib/sort.c`](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/lib/sort.c), retaining its GPL-2.0 identifier:
+
+```sh
+git add linux_sort_demo.c
+git commit -m "Try Linux snippet"
+```
+
+Formatting, Clippy, and the Rust tests passed. The provenance hook rejected the commit with exit code 1:
+
+```text
+linux_sort_demo.c: unresolved
+  unresolved: source licensing requires immutable, admitted evidence; scanner license labels alone do not grant permission
+Check blocked; no reported match is not proof of original authorship.
+```
+
+The JSON report identified a snippet match against `lib/sort.c` in the `srcres258/linux-doc` fork. SCANOSS reported `90%` matched, with local lines 8-82 corresponding to upstream lines 211-285. This is the scanner's reported match percentage, not a probability of infringement. Hosted corpus results can change.
+
+The commit was blocked because the matched source had no admitted evidence. This exercised copied-source detection and rejection of unresolved provenance; it did not reach a specific GPL-incompatibility decision. The scanner returned several repository-level license labels, including MIT, but none could authorize reuse of this particular snippet. No commit was created, and the source remained staged for inspection.
+
+### Example: permitted source still needs attribution
+
+The repository admits the pinned MIT-licensed SCANOSS winnowing source and records its existing local uses. In another disposable-clone test, we staged an additional copy at `copied_public.py` without recording that new use. The actual commit hook rejected it as `notice_required`, even though its source evidence and license were already approved.
+
+The resolution is to [prepare a notice update](#prepare-or-update-notices), review and stage the patch, then rerun the check. Existing approval does not automatically cover an unrecorded local use.
+
+The same test also confirmed that the hook checks staged bytes and preserves unstaged edits to the copied file. A separate commit attempt deleting the admitted upstream `LICENSE` was rejected, while a clean commit succeeded.
+
 ## Install from source
 
 Install Git, then install Rust with rustup. Clone and build:
