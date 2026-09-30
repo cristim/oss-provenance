@@ -118,6 +118,8 @@ An enforced and verified provider/test sandbox is required before automatic repa
 
 ## Hook and CI integration
 
+This repository runs its own provenance hook alongside formatting, Clippy, and tests. The hook installs a checker pinned to a full published commit ID. Follow the [self-hook setup](docs/self-hook.md#enable-the-hook-in-a-clone) to review and admit the repository policy, then install the hook in a new clone.
+
 The supplied `.pre-commit-hooks.yaml` exposes hook ID `oss-provenance`. For a local install:
 
 ```yaml

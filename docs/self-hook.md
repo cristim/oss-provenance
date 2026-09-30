@@ -20,6 +20,24 @@ The initial full-tree assessment returned no matches for the 16 included source 
 
 MIT is the only allowed license requirement. Every discovered match still needs reviewed source evidence; a scanner's MIT label cannot clear it. Other license requirements remain unresolved until the maintainer changes and re-admits the policy.
 
+## Enable the hook in a clone
+
+Install `pre-commit` and Rust through your usual tooling. Review `.oss-provenance.toml`, the recorded upstream evidence, and the coverage exclusions above. The initial reviewed policy commit is `e439647c7e9106f8ad677e5413738044b6b4b47b`. To admit that policy and install the configured hooks:
+
+```sh
+git config --local oss-provenance.policy-ref e439647c7e9106f8ad677e5413738044b6b4b47b
+pre-commit install --install-hooks
+pre-commit run oss-provenance --all-files
+```
+
+The last command invokes the hook even without changed files. It validates the existing notice ledger and scans staged changes; `--all-files` here does not turn the hook into a full-tree assessment. Ordinary commits run formatting, Clippy, tests, and the provenance check. A clone without explicit policy admission fails the provenance check.
+
+For a fresh full-tree assessment, install the CLI as described in the main README and run:
+
+```sh
+oss-provenance check --all --base e439647c7e9106f8ad677e5413738044b6b4b47b --head HEAD --policy-ref e439647c7e9106f8ad677e5413738044b6b4b47b
+```
+
 ## Policy maintenance
 
 Policy admission is local Git configuration containing a full immutable commit ID. Cloning the repository does not admit a policy automatically. Evaluate the complete proposed tree before admitting a policy change, retaining the prior ledger baseline:
