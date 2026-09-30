@@ -100,6 +100,8 @@ The index supplies file contents, including partially staged files. Full commit 
 
 Exit 0 means no unresolved in-scope findings or violations of the admitted, machine-checkable obligations. It does not certify all legal obligations or complete corpus coverage. Exit 1 means blocked, unresolved, insufficient coverage, missing notice, or evaluation-only results. Exit 2 means an operational or configuration error. JSON is available for completed assessment reports; operational errors are currently written to stderr.
 
+Text reports show the project license and use context, numbered findings, local and upstream ranges, unverified scanner labels, and exact policy evidence when available. The numbers match `collect-evidence --finding` for a JSON report from the same scan; choose the index again after rescanning. Scanner fields are untrusted data and never grant reuse permission. A finding without matching policy evidence says its snippet license is unverified. The report gives next steps for notices, evidence review, and an isolated rewrite. A rewrite handoff does not run an agent or certify independent authorship.
+
 Empty, tiny, binary, non-UTF-8, symlink, and submodule inputs cannot silently pass as scanned text. Explicit policy exclusions appear in reports. Every changed file is considered; a fingerprintable file does not guarantee detection of every tiny addition.
 
 ## Resolve source licensing
@@ -141,7 +143,9 @@ To remove recorded reuse, add a maintainer-reviewed `[[retirements]]` record to 
 oss-provenance resolve --staged --agent claude --brief /path/to/independent-requirements.md --output /path/to/new-handoff
 ```
 
-`--agent codex` is also accepted. This currently prepares a blocked handoff only. It copies the explicit behavioral brief and target paths, without copying source matches, repository history, or prior conversations. No provider is launched, no candidate tests are executed, and no automatic rewrite/retry loop is claimed. The handoff directs the caller to an isolated fresh session, trusted tests, a rescan, and a two-attempt limit.
+`--agent codex` is also accepted. This currently prepares a blocked handoff only. It copies the explicit behavioral brief and target paths, without copying source matches, repository history, or prior conversations. No provider is launched, no candidate tests are executed, and no automatic rewrite/retry loop is claimed.
+
+The diagnostic instructions and `handoff.json` specify a limit of **10 unsuccessful rewrite attempts** (`max_attempts: 10`). The caller starts each attempt in a fresh, isolated agent session using independent requirements and approved interfaces and tests. Do not pass suspect code, source reports, or the previous conversation to the rewrite agent. Test each replacement in a separate restricted sandbox with unchanged trusted tests, then stage the exact changed paths and rerun the provenance check. Give retries only behavioral failure feedback. Stop once the replacement passes; after 10 unsuccessful attempts, leave the finding blocked. The caller manages this limit; the tool does not execute or count attempts yet.
 
 An enforced and verified provider/test sandbox is required before automatic repair can be enabled. A fresh session alone is not proof of independent creation. See [remaining limitations](known-issues.md).
 

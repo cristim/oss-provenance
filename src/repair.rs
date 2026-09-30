@@ -49,8 +49,8 @@ pub fn prepare_handoff(
         output.join("handoff.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "version":1,"agent":agent,"status":"manual_isolation_required","targets":targets,
-            "policy_ref":report.policy_ref,"max_attempts":2,
-            "instructions":"Start a new non-resumed session in an enforced isolated environment containing only requirements.md and independently approved interfaces/tests. Do not mount the repository, history, source evidence or prior conversations. Test candidate code in a separate restricted sandbox, then run oss-provenance check on the reviewed staged replacement. Stop blocked after two unsuccessful attempts. This handoff does not certify clean-room authorship."
+            "policy_ref":report.policy_ref,"max_attempts":10,
+            "instructions":"Start a new non-resumed session in an enforced isolated environment containing only requirements.md and independently approved interfaces/tests. Do not mount the repository, history, source evidence or prior conversations. Test candidate code in a separate restricted sandbox, then run oss-provenance check on the reviewed staged replacement. Stop blocked after 10 unsuccessful attempts. This handoff does not certify clean-room authorship."
         }))?,
     )?;
     Ok(())
