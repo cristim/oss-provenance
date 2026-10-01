@@ -12,6 +12,13 @@ use std::time::{Duration, Instant};
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
 const MAX_ARTIFACTS: usize = 64;
 const MAX_TOTAL: usize = 32 * 1024 * 1024;
+const MAX_TREE_PAGES: usize = 100;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceHost {
+    GitHub,
+    GitLab,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Proposal {
@@ -21,8 +28,8 @@ pub struct Proposal {
 }
 
 struct Identity {
-    owner: String,
-    repo: String,
+    host: SourceHost,
+    project: String,
     path: String,
     version: String,
     md5: String,
@@ -49,34 +56,41 @@ impl Identity {
         let url = Url::parse(raw_url).context("invalid repository URL")?;
         ensure!(
             url.scheme() == "https"
-                && url.host_str() == Some("github.com")
+                && matches!(url.host_str(), Some("github.com" | "gitlab.com"))
                 && url.username().is_empty()
                 && url.password().is_none()
                 && url.port().is_none()
                 && url.query().is_none()
                 && url.fragment().is_none(),
-            "only public HTTPS github.com repository URLs are supported"
+            "only public HTTPS github.com and gitlab.com repository URLs are supported"
         );
-        let parts: Vec<_> = url
+        let host = if url.host_str() == Some("github.com") {
+            SourceHost::GitHub
+        } else {
+            SourceHost::GitLab
+        };
+        let mut parts: Vec<_> = url
             .path()
             .trim_end_matches('/')
             .split('/')
             .skip(1)
             .collect();
         ensure!(
-            parts.len() == 2,
-            "repository URL must identify owner/repository"
+            parts.len() >= 2 && (host == SourceHost::GitLab || parts.len() == 2),
+            "repository URL must identify a namespace and repository"
         );
-        let repo = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
-        for part in [parts[0], repo] {
+        let last = parts.last_mut().unwrap();
+        *last = last.strip_suffix(".git").unwrap_or(last);
+        for part in &parts {
             ensure!(
                 !part.is_empty()
-                    && part != "."
-                    && part != ".."
+                    && *part != "."
+                    && *part != ".."
+                    && (host != SourceHost::GitLab || *part != "-")
                     && part
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
-                "unsupported GitHub repository name"
+                "unsupported repository name"
             );
         }
         policy::safe_path(path)?;
@@ -86,25 +100,55 @@ impl Identity {
         );
         ensure!(hex_hash(md5, 32), "invalid upstream file MD5");
         Ok(Self {
-            owner: parts[0].into(),
-            repo: repo.into(),
+            host,
+            project: parts.join("/"),
             path: path.into(),
             version: version.into(),
             md5: md5.into(),
         })
     }
 
-    fn url(&self, host: &str, rest: &[&str]) -> Result<Url> {
-        let mut url = Url::parse(&format!("https://{host}"))?;
+    fn repository(&self) -> String {
+        let host = match self.host {
+            SourceHost::GitHub => "github.com",
+            SourceHost::GitLab => "gitlab.com",
+        };
+        format!("https://{host}/{}", self.project)
+    }
+
+    fn api_url(&self, rest: &[&str]) -> Result<Url> {
+        let mut url = Url::parse(match self.host {
+            SourceHost::GitHub => "https://api.github.com",
+            SourceHost::GitLab => "https://gitlab.com",
+        })?;
         let mut segments = url
             .path_segments_mut()
             .map_err(|_| anyhow::anyhow!("invalid fixed host"))?;
-        if host == "api.github.com" {
-            segments.push("repos");
+        match self.host {
+            SourceHost::GitHub => {
+                segments.push("repos").extend(self.project.split('/'));
+            }
+            SourceHost::GitLab => {
+                segments.extend(["api", "v4", "projects", &self.project]);
+            }
         }
-        segments.extend([self.owner.as_str(), self.repo.as_str()]);
         segments.extend(rest);
         drop(segments);
+        Ok(url)
+    }
+
+    fn source_url(&self, revision: &str, path: &str) -> Result<Url> {
+        if self.host == SourceHost::GitLab {
+            let mut url = self.api_url(&["repository", "files", path, "raw"])?;
+            url.query_pairs_mut().append_pair("ref", revision);
+            return Ok(url);
+        }
+        let mut url = Url::parse("https://raw.githubusercontent.com")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid fixed host"))?
+            .extend(self.project.split('/'))
+            .push(revision)
+            .extend(path.split('/'));
         Ok(url)
     }
 }
@@ -120,6 +164,22 @@ struct Download {
     client: Client,
     deadline: Instant,
     total: usize,
+}
+
+struct Page {
+    bytes: Vec<u8>,
+    page: Option<String>,
+    next_page: Option<String>,
+}
+
+fn pagination_header(headers: &reqwest::header::HeaderMap, name: &str) -> Result<Option<String>> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next();
+    ensure!(values.next().is_none(), "duplicate GitLab {name} header");
+    first
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()
+        .context("invalid GitLab pagination header")
 }
 
 impl Download {
@@ -139,11 +199,15 @@ impl Download {
     }
 
     fn get(&mut self, url: Url) -> Result<Vec<u8>> {
+        Ok(self.get_page(url)?.bytes)
+    }
+
+    fn get_page(&mut self, url: Url) -> Result<Page> {
         ensure!(
             url.scheme() == "https"
                 && matches!(
                     url.host_str(),
-                    Some("api.github.com" | "raw.githubusercontent.com")
+                    Some("api.github.com" | "raw.githubusercontent.com" | "gitlab.com")
                 ),
             "unsupported download host"
         );
@@ -162,6 +226,8 @@ impl Download {
             "upstream evidence returned HTTP {}",
             response.status()
         );
+        let page = pagination_header(response.headers(), "x-page")?;
+        let next_page = pagination_header(response.headers(), "x-next-page")?;
         let mut bytes = Vec::new();
         response
             .take(MAX_RESPONSE + 1)
@@ -176,7 +242,11 @@ impl Download {
             self.total <= MAX_TOTAL,
             "evidence collection exceeds 32 MiB"
         );
-        Ok(bytes)
+        Ok(Page {
+            bytes,
+            page,
+            next_page,
+        })
     }
 }
 
@@ -205,6 +275,103 @@ struct Entry {
     mode: String,
     #[serde(rename = "type")]
     kind: String,
+}
+
+struct ResolvedTree {
+    revision: String,
+    entries: Vec<Entry>,
+    metadata: BTreeMap<String, Vec<u8>>,
+}
+
+fn resolve_tree(
+    identity: &Identity,
+    mut fetch: impl FnMut(Url) -> Result<Page>,
+) -> Result<ResolvedTree> {
+    if identity.host == SourceHost::GitHub {
+        let commit_bytes = fetch(identity.api_url(&["commits", &identity.version])?)?.bytes;
+        let commit: Commit =
+            serde_json::from_slice(&commit_bytes).context("invalid GitHub commit response")?;
+        ensure!(
+            hex_hash(&commit.sha, 40) && hex_hash(&commit.commit.tree.sha, 40),
+            "GitHub did not return immutable commit/tree IDs"
+        );
+        ensure!(
+            !hex_hash(&identity.version, 40) || identity.version == commit.sha,
+            "resolved commit differs from requested immutable revision"
+        );
+        let mut url = identity.api_url(&["git", "trees", &commit.commit.tree.sha])?;
+        url.set_query(Some("recursive=1"));
+        let tree_bytes = fetch(url)?.bytes;
+        let tree: Tree =
+            serde_json::from_slice(&tree_bytes).context("invalid GitHub tree response")?;
+        ensure!(
+            !tree.truncated && tree.sha == commit.commit.tree.sha,
+            "incomplete or mismatched revision tree"
+        );
+        return Ok(ResolvedTree {
+            revision: commit.sha,
+            entries: tree.tree,
+            metadata: BTreeMap::from([
+                ("commit.json".into(), commit_bytes),
+                ("tree.json".into(), tree_bytes),
+            ]),
+        });
+    }
+    let commit_bytes =
+        fetch(identity.api_url(&["repository", "commits", &identity.version])?)?.bytes;
+    let commit: Value =
+        serde_json::from_slice(&commit_bytes).context("invalid GitLab commit response")?;
+    let revision = commit["id"].as_str().context("missing GitLab commit ID")?;
+    ensure!(
+        hex_hash(revision, 40),
+        "GitLab did not return an immutable commit ID"
+    );
+    ensure!(
+        !hex_hash(&identity.version, 40) || identity.version == revision,
+        "resolved commit differs from requested immutable revision"
+    );
+    let revision = revision.to_owned();
+    let mut metadata = BTreeMap::from([("commit.json".into(), commit_bytes)]);
+    let mut entries = Vec::new();
+    for number in 1..=MAX_TREE_PAGES {
+        let number_text = number.to_string();
+        let mut url = identity.api_url(&["repository", "tree"])?;
+        url.query_pairs_mut().extend_pairs([
+            ("ref", revision.as_str()),
+            ("recursive", "true"),
+            ("per_page", "100"),
+            ("page", number_text.as_str()),
+        ]);
+        let response = fetch(url)?;
+        ensure!(
+            response.page.as_deref() == Some(number_text.as_str()),
+            "missing or mismatched GitLab tree page accounting"
+        );
+        let next = response
+            .next_page
+            .as_deref()
+            .context("missing GitLab next-page accounting")?;
+        let page: Vec<Entry> =
+            serde_json::from_slice(&response.bytes).context("invalid GitLab tree response")?;
+        ensure!(
+            page.len() <= 100 && (next.is_empty() || !page.is_empty()),
+            "invalid GitLab tree page size"
+        );
+        entries.extend(page);
+        metadata.insert(format!("tree-{number}.json"), response.bytes);
+        if next.is_empty() {
+            return Ok(ResolvedTree {
+                revision,
+                entries,
+                metadata,
+            });
+        }
+        ensure!(
+            next == (number + 1).to_string(),
+            "nonsequential GitLab tree pagination"
+        );
+    }
+    anyhow::bail!("GitLab tree exceeds 100 pages; manual collection required")
 }
 
 fn applicable(path: &str, source: &str) -> bool {
@@ -289,7 +456,7 @@ fn verify_source_with_cache(
 ) -> Result<Vec<u8>> {
     ensure!(
         hex_hash(&evidence.revision, 40),
-        "source verification requires a full GitHub commit hash"
+        "source verification requires a full GitHub or GitLab commit hash"
     );
     ensure!(
         hex_hash(&evidence.source_sha256, 64),
@@ -301,9 +468,7 @@ fn verify_source_with_cache(
         &evidence.revision,
         &evidence.file_md5,
     )?;
-    let mut rest = vec![evidence.revision.as_str()];
-    rest.extend(evidence.path.split('/'));
-    let url = identity.url("raw.githubusercontent.com", &rest)?;
+    let url = identity.source_url(&evidence.revision, &evidence.path)?;
     let download = Download::new(timeout_secs)?;
     let key = crate::cache::key(&[
         b"source",
@@ -345,10 +510,15 @@ fn collect_inner(
     timeout_secs: u64,
     scancode: Option<(&[u8], &str)>,
 ) -> Result<Proposal> {
-    ensure!(
-        (1..=300).contains(&timeout_secs),
-        "evidence timeout must be 1..300 seconds"
-    );
+    let mut download = Download::new(timeout_secs)?;
+    collect_with_fetch(candidate, scancode, |url| download.get_page(url))
+}
+
+fn collect_with_fetch(
+    candidate: &Candidate,
+    scancode: Option<(&[u8], &str)>,
+    mut fetch: impl FnMut(Url) -> Result<Page>,
+) -> Result<Proposal> {
     let mut proposal = Proposal {
         evidence: None,
         artifacts: BTreeMap::new(),
@@ -361,27 +531,10 @@ fn collect_inner(
             return Ok(proposal);
         }
     };
-    let mut download = Download::new(timeout_secs)?;
-    let commit_bytes =
-        download.get(identity.url("api.github.com", &["commits", &identity.version])?)?;
-    let commit: Commit =
-        serde_json::from_slice(&commit_bytes).context("invalid GitHub commit response")?;
-    ensure!(
-        hex_hash(&commit.sha, 40) && hex_hash(&commit.commit.tree.sha, 40),
-        "GitHub did not return immutable commit/tree IDs"
-    );
-    let mut tree_url =
-        identity.url("api.github.com", &["git", "trees", &commit.commit.tree.sha])?;
-    tree_url.set_query(Some("recursive=1"));
-    let tree_bytes = download.get(tree_url)?;
-    let tree: Tree = serde_json::from_slice(&tree_bytes).context("invalid GitHub tree response")?;
-    ensure!(
-        !tree.truncated && tree.sha == commit.commit.tree.sha,
-        "incomplete or mismatched revision tree"
-    );
+    let tree = resolve_tree(&identity, &mut fetch)?;
     let mut paths = BTreeSet::new();
     let mut selected = Vec::new();
-    for entry in &tree.tree {
+    for entry in &tree.entries {
         policy::safe_path(&entry.path)?;
         ensure!(paths.insert(&entry.path), "duplicate upstream tree path");
         if entry.path == identity.path || applicable(&entry.path, &identity.path) {
@@ -404,23 +557,16 @@ fn collect_inner(
         selected.len() <= MAX_ARTIFACTS,
         "more than 64 evidence files require manual collection"
     );
+    let repository = identity.repository();
     let prefix = format!(
         "LICENSE-NOTICES/{}",
-        policy::sha256(
-            format!(
-                "{}/{}/{}/{}",
-                identity.owner, identity.repo, commit.sha, identity.path
-            )
-            .as_bytes()
-        )
+        policy::sha256(format!("{}/{}/{}", repository, tree.revision, identity.path).as_bytes())
     );
     let mut files = BTreeMap::new();
     for path in selected {
-        let mut rest = vec![commit.sha.as_str()];
-        rest.extend(path.split('/'));
         files.insert(
             path.to_owned(),
-            download.get(identity.url("raw.githubusercontent.com", &rest)?)?,
+            fetch(identity.source_url(&tree.revision, path)?)?.bytes,
         );
     }
     let source = &files[&identity.path];
@@ -468,18 +614,15 @@ fn collect_inner(
             .artifacts
             .insert(format!("{prefix}/upstream/{path}"), bytes);
     }
-    proposal
-        .artifacts
-        .insert(format!("{prefix}/commit.json"), commit_bytes);
-    proposal
-        .artifacts
-        .insert(format!("{prefix}/tree.json"), tree_bytes);
+    for (name, bytes) in tree.metadata {
+        proposal.artifacts.insert(format!("{prefix}/{name}"), bytes);
+    }
     proposal.issues.push("Pending review: confirm grant applicability, third-party exceptions, selected license branch, obligations, and project use context before policy admission".into());
     if let Some(license) = expression {
         proposal.evidence = Some(Evidence {
             file_md5: identity.md5, source_sha256,
-            repository: format!("https://github.com/{}/{}", identity.owner, identity.repo),
-            revision: commit.sha, path: identity.path, selected_license: license.clone(), license,
+            repository,
+            revision: tree.revision, path: identity.path, selected_license: license.clone(), license,
             review: "PENDING: collected source and grant artifacts; applicability and obligations have not been reviewed".into(),
             obligations: Obligations::Unsupported { reason: "PENDING: review source-level obligations before selecting a supported enforcement rule".into() },
             artifacts: proposal.artifacts.iter().map(|(path, bytes)| Artifact { path: path.clone(), sha256: policy::sha256(bytes) }).collect(),
@@ -568,6 +711,277 @@ fn scancode_expressions(
         "ScanCode report does not cover every collected upstream artifact"
     );
     Ok(expressions)
+}
+
+#[cfg(test)]
+mod gitlab_tests {
+    use super::*;
+
+    const REVISION: &str = "f6a93079dd611ffeec26f9f599dc1f78397f41ba";
+    const SOURCE: &[u8] = include_bytes!("../LICENSE-NOTICES/gitlab-labkit/fields.go");
+    const LICENSE: &[u8] = include_bytes!("../LICENSE-NOTICES/gitlab-labkit/LICENSE");
+    const PAGES: [&str; 9] = [
+        include_str!("../tests/fixtures/gitlab/tree-1.json"),
+        include_str!("../tests/fixtures/gitlab/tree-2.json"),
+        include_str!("../tests/fixtures/gitlab/tree-3.json"),
+        include_str!("../tests/fixtures/gitlab/tree-4.json"),
+        include_str!("../tests/fixtures/gitlab/tree-5.json"),
+        include_str!("../tests/fixtures/gitlab/tree-6.json"),
+        include_str!("../tests/fixtures/gitlab/tree-7.json"),
+        include_str!("../tests/fixtures/gitlab/tree-8.json"),
+        include_str!("../tests/fixtures/gitlab/tree-9.json"),
+    ];
+
+    fn candidate() -> Candidate {
+        Candidate {
+            id: "file".into(),
+            local_ranges: vec![(1, 1)],
+            upstream_ranges: vec![],
+            url: Some("https://gitlab.com/gitlab-org/labkit".into()),
+            file: Some("fields/fields.go".into()),
+            file_hash: Some("da966675939febb440609aeea0bac49b".into()),
+            licenses: vec!["MIT".into()],
+            raw: serde_json::json!({"version":"master"}),
+        }
+    }
+
+    fn recorded(url: Url) -> Result<Page> {
+        assert_eq!(url.host_str(), Some("gitlab.com"));
+        assert!(
+            url.path()
+                .starts_with("/api/v4/projects/gitlab-org%2Flabkit/repository/")
+        );
+        let query: BTreeMap<_, _> = url.query_pairs().collect();
+        if url.path().ends_with("/commits/master") {
+            assert!(query.is_empty());
+            return Ok(Page {
+                bytes: include_bytes!("../tests/fixtures/gitlab/commit.json").to_vec(),
+                page: None,
+                next_page: None,
+            });
+        }
+        assert_eq!(query["ref"], REVISION);
+        if url.path().ends_with("/tree") {
+            assert_eq!(query["recursive"], "true");
+            assert_eq!(query["per_page"], "100");
+            let number: usize = query["page"].parse()?;
+            let value: Value = serde_json::from_str(PAGES[number - 1])?;
+            return Ok(Page {
+                bytes: serde_json::to_vec(&value["body"])?,
+                page: value["page"].as_str().map(str::to_owned),
+                next_page: value["next_page"].as_str().map(str::to_owned),
+            });
+        }
+        let bytes = if url.path().ends_with("/files/fields%2Ffields.go/raw") {
+            SOURCE
+        } else if url.path().ends_with("/files/LICENSE/raw") {
+            LICENSE
+        } else {
+            anyhow::bail!("unexpected fixture request: {url}")
+        };
+        Ok(Page {
+            bytes: bytes.to_vec(),
+            page: None,
+            next_page: None,
+        })
+    }
+
+    #[test]
+    fn recorded_gitlab_collection_pins_all_nine_pages_and_exact_grants() {
+        let mut requests = 0;
+        let proposal = collect_with_fetch(&candidate(), None, |url| {
+            requests += 1;
+            recorded(url)
+        })
+        .unwrap();
+        assert_eq!(requests, 12);
+        assert_eq!(proposal.artifacts.len(), 12);
+        assert!(proposal.artifacts.values().any(|bytes| bytes == SOURCE));
+        assert!(proposal.artifacts.values().any(|bytes| bytes == LICENSE));
+        assert!(
+            proposal
+                .artifacts
+                .keys()
+                .any(|path| path.ends_with("/tree-9.json"))
+        );
+        assert!(proposal.evidence.is_none());
+        assert!(
+            proposal
+                .issues
+                .iter()
+                .any(|issue| issue.starts_with("Pending review:"))
+        );
+        assert_eq!(
+            policy::sha256(SOURCE),
+            "f0356f426a0da955390eec27c5f546d6d72e3241bf3fcc21f39d41a422308747"
+        );
+        assert_eq!(
+            policy::sha256(LICENSE),
+            "d08172d312bc93d0d098342e1ac50d35439152e5ea17c4f668e55e868fd4d1da"
+        );
+    }
+
+    #[test]
+    fn gitlab_rejects_missing_repeated_and_skipped_page_accounting() {
+        for (page, next_page) in [
+            (None, Some("2")),
+            (Some("2"), Some("2")),
+            (Some("1"), None),
+            (Some("1"), Some("1")),
+            (Some("1"), Some("3")),
+        ] {
+            assert!(
+                collect_with_fetch(&candidate(), None, |url| {
+                    let first = url
+                        .query_pairs()
+                        .any(|(key, value)| key == "page" && value == "1");
+                    let mut response = recorded(url)?;
+                    if first {
+                        response.page = page.map(str::to_owned);
+                        response.next_page = next_page.map(str::to_owned);
+                    }
+                    Ok(response)
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn gitlab_rejects_duplicate_pagination_headers_before_conversion() {
+        for name in ["x-page", "x-next-page"] {
+            for values in [["", "2"], ["2", ""], ["1", "1"]] {
+                let mut headers = reqwest::header::HeaderMap::new();
+                for value in values {
+                    headers.append(name, value.parse().unwrap());
+                }
+                assert!(
+                    pagination_header(&headers, name)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("duplicate")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gitlab_rejects_revision_changes_and_unbounded_trees() {
+        let mut pinned = candidate();
+        pinned.raw["version"] = "0".repeat(40).into();
+        let error = collect_with_fetch(&pinned, None, |_| {
+            recorded(Url::parse("https://gitlab.com/api/v4/projects/gitlab-org%2Flabkit/repository/commits/master").unwrap())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("differs from requested"));
+
+        let mut pages = 0;
+        let error = collect_with_fetch(&candidate(), None, |url| {
+            if !url.path().ends_with("/tree") {
+                return recorded(url);
+            }
+            pages += 1;
+            Ok(Page {
+                bytes: br#"[{"path":"file","mode":"100644","type":"blob"}]"#.to_vec(),
+                page: Some(pages.to_string()),
+                next_page: Some((pages + 1).to_string()),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(pages, MAX_TREE_PAGES);
+        assert!(error.to_string().contains("exceeds 100 pages"));
+    }
+
+    #[test]
+    fn gitlab_rejects_links_duplicates_and_source_hash_mismatches() {
+        for mode in ["120000", "160000"] {
+            assert!(
+                collect_with_fetch(&candidate(), None, |url| {
+                    let tree = url.path().ends_with("/tree");
+                    let mut response = recorded(url)?;
+                    if tree {
+                        let mut entries: Vec<Value> = serde_json::from_slice(&response.bytes)?;
+                        for entry in &mut entries {
+                            if entry["path"] == "fields/fields.go" {
+                                entry["mode"] = mode.into();
+                            }
+                        }
+                        response.bytes = serde_json::to_vec(&entries)?;
+                    }
+                    Ok(response)
+                })
+                .unwrap_err()
+                .to_string()
+                .contains("regular file")
+            );
+        }
+        assert!(
+            collect_with_fetch(&candidate(), None, |url| {
+                let tree = url.path().ends_with("/tree");
+                let mut response = recorded(url)?;
+                if tree {
+                    let mut entries: Vec<Value> = serde_json::from_slice(&response.bytes)?;
+                    if entries.len() > 1 {
+                        entries[1] = entries[0].clone();
+                    }
+                    response.bytes = serde_json::to_vec(&entries)?;
+                }
+                Ok(response)
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate")
+        );
+        let mut bad = candidate();
+        bad.file_hash = Some("0".repeat(32));
+        let proposal = collect_with_fetch(&bad, None, recorded).unwrap();
+        assert!(proposal.evidence.is_none() && proposal.artifacts.is_empty());
+        assert!(proposal.issues[0].contains("MD5 differs"));
+    }
+
+    #[test]
+    fn nested_gitlab_projects_use_encoded_segments_and_separate_origins() {
+        let identity = Identity::new(
+            "https://gitlab.com/group/subgroup/repo.git",
+            "src/a b.rs",
+            "release/1",
+            &"0".repeat(32),
+        )
+        .unwrap();
+        assert_eq!(
+            identity.repository(),
+            "https://gitlab.com/group/subgroup/repo"
+        );
+        assert_eq!(
+            identity
+                .api_url(&["repository", "commits", &identity.version])
+                .unwrap()
+                .as_str(),
+            "https://gitlab.com/api/v4/projects/group%2Fsubgroup%2Frepo/repository/commits/release%2F1"
+        );
+        assert_eq!(
+            identity
+                .source_url(REVISION, &identity.path)
+                .unwrap()
+                .as_str(),
+            format!(
+                "https://gitlab.com/api/v4/projects/group%2Fsubgroup%2Frepo/repository/files/src%2Fa%20b.rs/raw?ref={REVISION}"
+            )
+        );
+        for url in [
+            "https://gitlab.com.evil.invalid/group/repo",
+            "https://user@gitlab.com/group/repo",
+            "https://gitlab.com:8443/group/repo",
+            "https://gitlab.com/group/repo?token=x",
+            "https://gitlab.com/group/repo/-/tree/main",
+            "https://gitlab.com/group/%2Frepo",
+        ] {
+            assert!(
+                Identity::new(url, "src/a.rs", REVISION, &"0".repeat(32)).is_err(),
+                "{url}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -761,7 +1175,7 @@ mod tests {
             verify_source(&evidence, 1)
                 .unwrap_err()
                 .to_string()
-                .contains("full GitHub commit")
+                .contains("full GitHub or GitLab commit")
         );
     }
 
