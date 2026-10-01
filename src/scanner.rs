@@ -45,6 +45,9 @@ pub struct Scanner {
     client: Client,
     timeout: Duration,
     cache: crate::cache::Cache,
+    coordinator: crate::coordinator::Coordinator,
+    #[cfg(test)]
+    _coordinator_directory: tempfile::TempDir,
 }
 
 impl Scanner {
@@ -80,7 +83,17 @@ impl Scanner {
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("oss-provenance/", env!("CARGO_PKG_VERSION")))
             .build()?;
+        #[cfg(test)]
+        let directory = tempfile::tempdir()?;
+        #[cfg(test)]
+        let coordinator =
+            crate::coordinator::Coordinator::at(directory.path().to_owned(), endpoint.as_str())?;
+        #[cfg(not(test))]
+        let coordinator = crate::coordinator::Coordinator::from_env(endpoint.as_str())?;
         Ok(Self {
+            coordinator,
+            #[cfg(test)]
+            _coordinator_directory: directory,
             endpoint,
             client,
             timeout,
@@ -131,7 +144,9 @@ impl Scanner {
 
     fn request(&self, wfp: &str) -> Result<Vec<u8>> {
         let deadline = std::time::Instant::now() + self.timeout;
+        let mut turn = self.coordinator.acquire(deadline)?;
         for attempt in 0..3 {
+            turn.before_post()?;
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             ensure!(
                 !remaining.is_zero(),
@@ -147,6 +162,7 @@ impl Scanner {
                 .timeout(remaining)
                 .multipart(form)
                 .send();
+            turn.complete()?;
             let (error, delay) = match response {
                 Err(error) => {
                     if !error.is_connect() && !error.is_timeout() {
@@ -196,6 +212,7 @@ impl Scanner {
                         }
                         let delay = retry_delay(response.headers(), attempt)
                             .with_context(|| format!("SCANOSS {description}: HTTP {status}"))?;
+                        turn.defer(delay)?;
                         (error, delay)
                     }
                 }
@@ -665,6 +682,7 @@ mod cache_retry_tests {
     struct Server {
         done: std::sync::mpsc::Sender<()>,
         thread: thread::JoinHandle<Vec<String>>,
+        times: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
     }
 
     impl Server {
@@ -681,6 +699,8 @@ mod cache_retry_tests {
             .unwrap();
         listener.set_nonblocking(true).unwrap();
         let (done, stopped) = std::sync::mpsc::channel();
+        let times = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let request_times = times.clone();
         let handle = thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(12);
             let mut requests = Vec::new();
@@ -731,6 +751,10 @@ mod cache_retry_tests {
                     .cloned()
                     .unwrap_or_else(|| response("500 Unexpected Request", "", ""));
                 requests.push(String::from_utf8(request).unwrap());
+                request_times
+                    .lock()
+                    .unwrap()
+                    .push(std::time::Instant::now());
                 stream.write_all(reply.as_bytes()).unwrap();
             }
         });
@@ -739,6 +763,7 @@ mod cache_retry_tests {
             Server {
                 done,
                 thread: handle,
+                times,
             },
         )
     }
@@ -770,6 +795,60 @@ mod cache_retry_tests {
                     })
             })
             .count()
+    }
+
+    #[test]
+    fn actual_posts_are_spaced_across_scanner_instances() {
+        let first = b"first coordinated input";
+        let second = b"second coordinated input";
+        let (endpoint, requests) = server(vec![
+            response("200 OK", "", &no_match(first)),
+            response("200 OK", "", &no_match(second)),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut scanner = Scanner::with_url(endpoint.clone(), 5).unwrap();
+        scanner.cache = crate::cache::Cache::default();
+        scanner.coordinator =
+            crate::coordinator::Coordinator::at(state.path().to_owned(), endpoint.as_str())
+                .unwrap();
+        scanner.scan("first", first).unwrap();
+        drop(scanner);
+        let mut next = Scanner::with_url(endpoint.clone(), 5).unwrap();
+        next.cache = crate::cache::Cache::default();
+        next.coordinator =
+            crate::coordinator::Coordinator::at(state.path().to_owned(), endpoint.as_str())
+                .unwrap();
+        next.scan("second", second).unwrap();
+        let times = requests.times.lock().unwrap().clone();
+        assert_eq!(times.len(), 2);
+        assert!(times[1].duration_since(times[0]) >= Duration::from_secs(1));
+        assert_eq!(requests.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn final_retry_after_blocks_the_next_instance_without_a_request() {
+        let (endpoint, requests) = server(vec![
+            response("503 Service Unavailable", "", ""),
+            response("503 Service Unavailable", "", ""),
+            response("429 Too Many Requests", "Retry-After: 60\r\n", ""),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut scanner = Scanner::with_url(endpoint.clone(), 10).unwrap();
+        scanner.cache = crate::cache::Cache::default();
+        scanner.coordinator =
+            crate::coordinator::Coordinator::at(state.path().to_owned(), endpoint.as_str())
+                .unwrap();
+        assert!(
+            format!("{:#}", scanner.scan("source", b"input").unwrap_err()).contains("3 attempts")
+        );
+        drop(scanner);
+        let mut next = Scanner::with_url(endpoint.clone(), 1).unwrap();
+        next.cache = crate::cache::Cache::default();
+        next.coordinator =
+            crate::coordinator::Coordinator::at(state.path().to_owned(), endpoint.as_str())
+                .unwrap();
+        assert!(format!("{:#}", next.scan("source", b"input").unwrap_err()).contains("cooldown"));
+        assert_eq!(requests.join().unwrap().len(), 3);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod cache;
 pub mod check;
+mod coordinator;
 pub mod evidence;
 pub mod fingerprint;
 pub mod git;

@@ -169,6 +169,8 @@ impl Fixture {
 
     fn cli(&self, args: &[&str]) -> Output {
         isolated(Command::new(BINARY))
+            .env("AI_CLEANROOM_STATE_DIR", self.path().join("scanner-state"))
+            .env_remove("OSS_PROVENANCE_STATE_DIR")
             .arg("--repo")
             .arg(self.path())
             .args(args)
@@ -178,6 +180,8 @@ impl Fixture {
 
     fn cli_with_cache(&self, cache: &Path, args: &[&str]) -> Output {
         isolated(Command::new(BINARY))
+            .env("AI_CLEANROOM_STATE_DIR", self.path().join("scanner-state"))
+            .env_remove("OSS_PROVENANCE_STATE_DIR")
             .env_remove("AI_CLEANROOM_CACHE_DIR")
             .arg("--repo")
             .arg(self.path())
