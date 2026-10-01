@@ -587,6 +587,27 @@ fn forged_scanner_identity_cannot_clear_unrelated_local_content() {
 }
 
 #[test]
+fn changed_operators_case_and_literals_require_correspondence_review() {
+    let fixture = Fixture::new();
+    let source = std::str::from_utf8(PUBLIC_SOURCE).unwrap();
+    let candidate = fixture.candidate(1, source.lines().count());
+    let mut statuses = Vec::new();
+    for (before, after) in [
+        ("64 * 1024", "64 + 1024"),
+        ("ASCII_A", "ASCII_a"),
+        ("'.exe'", "'exe.'"),
+    ] {
+        assert!(source.contains(before));
+        let modified = source.replace(before, after);
+        fixture.stage("source.py", modified.as_bytes());
+        let report = fixture.assess(&fixture.snapshot(), vec![candidate.clone()]);
+        assert!(!report.passed());
+        statuses.push(report.files[0].findings[0].status.clone());
+    }
+    assert_eq!(statuses, ["unresolved", "unresolved", "unresolved"]);
+}
+
+#[test]
 fn actual_source_hash_mismatch_is_an_operational_error() {
     let mut fixture = Fixture::new();
     fixture.stage("source.py", PUBLIC_SOURCE);
