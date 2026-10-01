@@ -249,12 +249,18 @@ pub fn assess(
                             && format!("{:x}", md5::Md5::digest(&upstream)) == evidence.file_md5,
                         "admitted source hashes differ from verified bytes"
                     );
-                    if !corresponds(&blob.bytes, &upstream, &finding.candidate) {
+                    let id = notices::evidence_id(evidence)?;
+                    if !corresponds(
+                        &blob.bytes,
+                        &upstream,
+                        &finding.candidate,
+                        &policy.reviewed_snippets,
+                        &id,
+                    ) {
                         finding.reason="local/upstream content correspondence is unsupported or differs from verified source".into();
                         file.findings.push(finding);
                         continue;
                     }
-                    let id = notices::evidence_id(evidence)?;
                     finding.evidence_id = Some(id.clone());
                     match policy.decide(evidence)? {
                         Decision::Allowed => {
@@ -342,7 +348,13 @@ fn tree_digest(files: &std::collections::BTreeMap<String, crate::git::Blob>) -> 
     format!("{:x}", digest.finalize())
 }
 
-fn corresponds(local: &[u8], upstream: &[u8], candidate: &Candidate) -> bool {
+fn corresponds(
+    local: &[u8],
+    upstream: &[u8],
+    candidate: &Candidate,
+    reviewed: &[policy::ReviewedSnippet],
+    evidence_id: &str,
+) -> bool {
     if candidate.id == "file" {
         return local == upstream;
     }
@@ -358,7 +370,21 @@ fn corresponds(local: &[u8], upstream: &[u8], candidate: &Candidate) -> bool {
         .all(|(local_range, upstream_range)| {
             match (range(local, *local_range), range(upstream, *upstream_range)) {
                 (Some(left), Some(right)) => {
-                    left.iter().any(|byte| !byte.is_ascii_whitespace()) && left == right
+                    if !left.iter().any(|byte| !byte.is_ascii_whitespace())
+                        || !right.iter().any(|byte| !byte.is_ascii_whitespace())
+                    {
+                        return false;
+                    }
+                    if left == right {
+                        return true;
+                    }
+                    let local_sha256 = policy::sha256(&left);
+                    let upstream_sha256 = policy::sha256(&right);
+                    reviewed.iter().any(|mapping| {
+                        mapping.evidence_id == evidence_id
+                            && mapping.local_sha256 == local_sha256
+                            && mapping.upstream_sha256 == upstream_sha256
+                    })
                 }
                 _ => false,
             }
@@ -411,33 +437,41 @@ mod tests {
         assert!(corresponds(
             b"int result = 1;\n",
             b"int result = 1;\n",
-            &candidate
+            &candidate,
+            &[],
+            ""
         ));
         assert!(!corresponds(
             b"int result = 1;\n",
             b"int result=1;\n",
-            &candidate
+            &candidate,
+            &[],
+            ""
         ));
         assert!(!corresponds(
             b"unrelated implementation\n",
             b"int result=1;\n",
-            &candidate
+            &candidate,
+            &[],
+            ""
         ));
-        assert!(!corresponds(b"\n", b"", &candidate));
-        assert!(!corresponds(b"\n", b"\n", &candidate));
-        assert!(!corresponds(b"!!!\n", b"...\n", &candidate));
+        assert!(!corresponds(b"\n", b"", &candidate, &[], ""));
+        assert!(!corresponds(b"\n", b"\n", &candidate, &[], ""));
+        assert!(!corresponds(b"!!!\n", b"...\n", &candidate, &[], ""));
         assert!(!corresponds(
             "你好\n".as_bytes(),
             "世界\n".as_bytes(),
-            &candidate
+            &candidate,
+            &[],
+            ""
         ));
         for local_ranges in [vec![], vec![(0, 1)], vec![(2, 1)], vec![(1, 2)]] {
             candidate.local_ranges = local_ranges;
-            assert!(!corresponds(b"source\n", b"source\n", &candidate));
+            assert!(!corresponds(b"source\n", b"source\n", &candidate, &[], ""));
         }
         candidate.local_ranges.clear();
         candidate.upstream_ranges.clear();
-        assert!(!corresponds(b"source\n", b"source\n", &candidate));
+        assert!(!corresponds(b"source\n", b"source\n", &candidate, &[], ""));
     }
     #[test]
     fn snapshot_identity_includes_gitlink_commit() {

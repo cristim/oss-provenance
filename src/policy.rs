@@ -22,6 +22,17 @@ pub struct Policy {
     pub evidence: Vec<Evidence>,
     #[serde(default)]
     pub retirements: Vec<Retirement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewed_snippets: Vec<ReviewedSnippet>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedSnippet {
+    pub evidence_id: String,
+    pub local_sha256: String,
+    pub upstream_sha256: String,
+    pub review: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -159,6 +170,7 @@ impl Policy {
             safe_path(path.trim_end_matches('/'))?;
         }
         let mut identities = BTreeSet::new();
+        let mut evidence_ids = BTreeSet::new();
         for evidence in &policy.evidence {
             ensure!(valid_hash(&evidence.file_md5, 32), "invalid evidence MD5");
             ensure!(
@@ -232,6 +244,34 @@ impl Policy {
                 ensure!(valid_hash(&artifact.sha256, 64), "invalid artifact SHA-256");
                 ensure!(paths.insert(&artifact.path), "duplicate evidence artifact");
             }
+            evidence_ids.insert(crate::notices::evidence_id(evidence)?);
+        }
+        ensure!(
+            policy.reviewed_snippets.len() <= 256,
+            "at most 256 reviewed snippet mappings are supported"
+        );
+        let mut mappings = BTreeSet::new();
+        for mapping in &policy.reviewed_snippets {
+            ensure!(
+                valid_hash(&mapping.evidence_id, 64) && evidence_ids.contains(&mapping.evidence_id),
+                "reviewed snippet must reference admitted evidence"
+            );
+            ensure!(
+                valid_hash(&mapping.local_sha256, 64) && valid_hash(&mapping.upstream_sha256, 64),
+                "invalid reviewed snippet SHA-256"
+            );
+            ensure!(
+                !mapping.review.trim().is_empty(),
+                "reviewed snippet requires an explicit review"
+            );
+            ensure!(
+                mappings.insert((
+                    &mapping.evidence_id,
+                    &mapping.local_sha256,
+                    &mapping.upstream_sha256
+                )),
+                "duplicate reviewed snippet mapping"
+            );
         }
         Ok(policy)
     }
