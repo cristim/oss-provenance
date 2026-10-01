@@ -3,7 +3,7 @@ use oss_provenance::{
     check::{self, Report},
     git::{Blob, Scope, Snapshot},
     notices,
-    policy::{self, Artifact, Evidence, Obligations, Policy, ScannerConfig},
+    policy::{self, Artifact, Evidence, Obligations, Policy, ReviewedSnippet, ScannerConfig},
     scanner::{Candidate, ScanResult},
 };
 use sha2::Sha256;
@@ -68,6 +68,7 @@ impl Fixture {
             exclude: vec![policy::POLICY_PATH.into(), "LICENSE-NOTICES/".into()],
             evidence: vec![evidence],
             retirements: Vec::new(),
+            reviewed_snippets: Vec::new(),
         };
         let policy_bytes = toml::to_string(&policy).unwrap().into_bytes();
         Policy::parse(&policy_bytes).unwrap();
@@ -590,6 +591,171 @@ fn changed_operators_case_and_literals_require_correspondence_review() {
         statuses.push(report.files[0].findings[0].status.clone());
     }
     assert_eq!(statuses, ["unresolved", "unresolved", "unresolved"]);
+}
+
+#[test]
+fn reviewed_modifications_preserve_existing_notices_and_require_exact_pairs() {
+    let mut fixture = Fixture::new();
+    let source = std::str::from_utf8(PUBLIC_SOURCE).unwrap();
+    let modified = source.replace("64 * 1024", "64 + 1024");
+    let end = source.lines().count();
+    let evidence = fixture.policy.evidence[0].clone();
+    let evidence_id = notices::evidence_id(&evidence).unwrap();
+    fixture.stage("original.py", PUBLIC_SOURCE);
+    let mut manifest = notices::load(&fixture.snapshot().files).unwrap();
+    notices::upsert(
+        &mut manifest,
+        &evidence,
+        "original.py",
+        1,
+        end,
+        PUBLIC_SOURCE,
+        "Existing reviewed use must retain its history",
+    )
+    .unwrap();
+    let original_notice = serde_json::to_vec(&manifest.entries[0]).unwrap();
+    for (path, bytes) in notices::proposed_files(&manifest).unwrap() {
+        fixture.stage(&path, &bytes);
+    }
+    fixture.commit();
+    fixture.stage("modified.py", modified.as_bytes());
+    let candidate = fixture.candidate(1, end);
+    let status = |report: Report| {
+        report
+            .files
+            .iter()
+            .find(|file| file.path == "modified.py")
+            .unwrap()
+            .findings[0]
+            .status
+            .clone()
+    };
+    let unreviewed = fixture.assess(&fixture.snapshot(), vec![candidate.clone()]);
+    assert_eq!(status(unreviewed), "unresolved");
+    fixture.policy.reviewed_snippets.push(ReviewedSnippet {
+        evidence_id: evidence_id.clone(),
+        local_sha256: policy::sha256(modified.as_bytes()),
+        upstream_sha256: policy::sha256(PUBLIC_SOURCE),
+        review: "Reviewed this exact modification and the existing source grant".into(),
+    });
+    fixture.policy_bytes = toml::to_string(&fixture.policy).unwrap().into_bytes();
+    fixture.policy = Policy::parse(&fixture.policy_bytes).unwrap();
+    assert_eq!(
+        notices::evidence_id(&fixture.policy.evidence[0]).unwrap(),
+        evidence_id
+    );
+    assert_eq!(
+        serde_json::to_vec(&manifest.entries[0]).unwrap(),
+        original_notice
+    );
+    fixture.stage(policy::POLICY_PATH, &fixture.policy_bytes);
+    fixture.git(&[
+        "commit",
+        "-m",
+        "admit reviewed mapping",
+        "--only",
+        policy::POLICY_PATH,
+    ]);
+    fixture.reference = fixture.git(&["rev-parse", "HEAD"]);
+    let snapshot = fixture.snapshot();
+    check::trusted_policy(&snapshot, &fixture.reference, false).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&notices::load(&snapshot.files).unwrap().entries[0]).unwrap(),
+        original_notice
+    );
+    let needs_notice = fixture.assess(&snapshot, vec![candidate.clone()]);
+    assert!(!needs_notice.passed());
+    assert_eq!(status(needs_notice), "notice_required");
+    notices::upsert(
+        &mut manifest,
+        &evidence,
+        "modified.py",
+        1,
+        end,
+        modified.as_bytes(),
+        "Reviewed modified reuse",
+    )
+    .unwrap();
+    assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(manifest.entries[0].uses.len(), 2);
+    assert!(
+        manifest.entries[0]
+            .uses
+            .iter()
+            .any(|usage| usage.path == "original.py"
+                && usage.description == "Existing reviewed use must retain its history")
+    );
+    for (path, bytes) in notices::proposed_files(&manifest).unwrap() {
+        fixture.stage(&path, &bytes);
+    }
+    let snapshot = fixture.snapshot();
+    assert!(fixture.assess(&snapshot, vec![candidate.clone()]).passed());
+    let mut wrong_range = candidate.clone();
+    wrong_range.upstream_ranges = vec![(2, end)];
+    let wrong = fixture.assess(&snapshot, vec![wrong_range]);
+    assert_eq!(status(wrong), "unresolved");
+    let mut file_match = candidate.clone();
+    file_match.id = "file".into();
+    assert_eq!(
+        status(fixture.assess(&snapshot, vec![file_match])),
+        "unresolved"
+    );
+    let mut unrelated = evidence;
+    unrelated.file_md5 = "a".repeat(32);
+    fixture.policy.reviewed_snippets[0].evidence_id = notices::evidence_id(&unrelated).unwrap();
+    fixture.policy.evidence.push(unrelated);
+    assert_eq!(
+        status(fixture.assess(&snapshot, vec![candidate.clone()])),
+        "unresolved"
+    );
+    fixture.policy.reviewed_snippets[0].evidence_id = evidence_id;
+    fixture.stage(
+        "modified.py",
+        modified.replace("64 + 1024", "64 - 1024").as_bytes(),
+    );
+    let changed = fixture.assess(&fixture.snapshot(), vec![candidate]);
+    assert!(!changed.passed());
+    assert_eq!(status(changed), "unresolved");
+}
+
+#[test]
+fn reviewed_mapping_policy_rejects_unknown_evidence_and_invalid_fields() {
+    let fixture = Fixture::new();
+    let mapping = ReviewedSnippet {
+        evidence_id: notices::evidence_id(&fixture.policy.evidence[0]).unwrap(),
+        local_sha256: policy::sha256(b"modified\n"),
+        upstream_sha256: policy::sha256(b"original\n"),
+        review: "Reviewed exact bytes".into(),
+    };
+    let mut policy = fixture.policy.clone();
+    policy.reviewed_snippets.push(mapping.clone());
+    assert!(Policy::parse(toml::to_string(&policy).unwrap().as_bytes()).is_ok());
+    for (field, value) in [
+        ("evidence_id", "0".repeat(64)),
+        ("local_sha256", String::new()),
+        ("upstream_sha256", "INVALID".into()),
+        ("review", " \n".into()),
+    ] {
+        let mut invalid = serde_json::to_value(&mapping).unwrap();
+        invalid[field] = value.into();
+        policy.reviewed_snippets = vec![serde_json::from_value(invalid).unwrap()];
+        assert!(
+            Policy::parse(toml::to_string(&policy).unwrap().as_bytes()).is_err(),
+            "{field}"
+        );
+    }
+    policy.reviewed_snippets = vec![mapping.clone(), mapping.clone()];
+    assert!(Policy::parse(toml::to_string(&policy).unwrap().as_bytes()).is_err());
+    policy.reviewed_snippets = vec![mapping.clone(); 257];
+    assert!(
+        Policy::parse(toml::to_string(&policy).unwrap().as_bytes())
+            .unwrap_err()
+            .to_string()
+            .contains("256")
+    );
+    let mut extra = serde_json::to_value(&mapping).unwrap();
+    extra["ignore_obligations"] = true.into();
+    assert!(serde_json::from_value::<ReviewedSnippet>(extra).is_err());
 }
 
 #[test]
