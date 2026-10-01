@@ -346,7 +346,9 @@ fn corresponds(local: &[u8], upstream: &[u8], candidate: &Candidate) -> bool {
     if candidate.id == "file" {
         return local == upstream;
     }
-    if candidate.local_ranges.len() != candidate.upstream_ranges.len() {
+    if candidate.local_ranges.is_empty()
+        || candidate.local_ranges.len() != candidate.upstream_ranges.len()
+    {
         return false;
     }
     candidate
@@ -355,7 +357,9 @@ fn corresponds(local: &[u8], upstream: &[u8], candidate: &Candidate) -> bool {
         .zip(&candidate.upstream_ranges)
         .all(|(local_range, upstream_range)| {
             match (range(local, *local_range), range(upstream, *upstream_range)) {
-                (Some(left), Some(right)) => !left.is_empty() && left == right,
+                (Some(left), Some(right)) => {
+                    left.iter().any(|byte| !byte.is_ascii_whitespace()) && left == right
+                }
                 _ => false,
             }
         })
@@ -366,14 +370,7 @@ fn range(bytes: &[u8], (start, end): (usize, usize)) -> Option<Vec<u8>> {
     if start == 0 || end < start || end > lines.len() {
         return None;
     }
-    Some(
-        lines[start - 1..end]
-            .concat()
-            .into_iter()
-            .filter(|b| b.is_ascii_alphanumeric())
-            .map(|b| b.to_ascii_lowercase())
-            .collect(),
-    )
+    Some(lines[start - 1..end].concat())
 }
 
 pub fn ensure_resolvable(report: &Report) -> Result<()> {
@@ -401,7 +398,7 @@ mod tests {
     }
     #[test]
     fn correspondence_requires_real_content() {
-        let candidate = Candidate {
+        let mut candidate = Candidate {
             id: "snippet".into(),
             local_ranges: vec![(1, 1)],
             upstream_ranges: vec![(1, 1)],
@@ -413,6 +410,11 @@ mod tests {
         };
         assert!(corresponds(
             b"int result = 1;\n",
+            b"int result = 1;\n",
+            &candidate
+        ));
+        assert!(!corresponds(
+            b"int result = 1;\n",
             b"int result=1;\n",
             &candidate
         ));
@@ -422,12 +424,20 @@ mod tests {
             &candidate
         ));
         assert!(!corresponds(b"\n", b"", &candidate));
+        assert!(!corresponds(b"\n", b"\n", &candidate));
         assert!(!corresponds(b"!!!\n", b"...\n", &candidate));
         assert!(!corresponds(
             "你好\n".as_bytes(),
             "世界\n".as_bytes(),
             &candidate
         ));
+        for local_ranges in [vec![], vec![(0, 1)], vec![(2, 1)], vec![(1, 2)]] {
+            candidate.local_ranges = local_ranges;
+            assert!(!corresponds(b"source\n", b"source\n", &candidate));
+        }
+        candidate.local_ranges.clear();
+        candidate.upstream_ranges.clear();
+        assert!(!corresponds(b"source\n", b"source\n", &candidate));
     }
     #[test]
     fn snapshot_identity_includes_gitlink_commit() {
