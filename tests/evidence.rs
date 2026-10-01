@@ -78,3 +78,43 @@ fn live_public_reference_collects_actual_grant_bytes() {
             if reason.starts_with("PENDING:")
     )));
 }
+
+#[test]
+#[ignore = "downloads only the pinned public GitLab LabKit source and its MIT grant"]
+fn live_gitlab_collection_and_source_verification_use_pinned_bytes() {
+    use oss_provenance::{
+        evidence::verify_source,
+        policy::{Evidence, Obligations, sha256},
+    };
+    let source = include_bytes!("../LICENSE-NOTICES/gitlab-labkit/fields.go");
+    let license = include_bytes!("../LICENSE-NOTICES/gitlab-labkit/LICENSE");
+    let revision = "f6a93079dd611ffeec26f9f599dc1f78397f41ba";
+    let mut input = candidate();
+    input.url = Some("https://gitlab.com/gitlab-org/labkit".into());
+    input.file = Some("fields/fields.go".into());
+    input.file_hash = Some("da966675939febb440609aeea0bac49b".into());
+    input.raw = json!({"version": revision});
+    let proposal = collect(&input, 60).unwrap();
+    assert!(proposal.artifacts.values().any(|bytes| bytes == source));
+    assert!(proposal.artifacts.values().any(|bytes| bytes == license));
+    assert!(
+        proposal
+            .artifacts
+            .keys()
+            .any(|path| path.ends_with("/tree-9.json"))
+    );
+    assert!(proposal.evidence.is_none());
+    let evidence = Evidence {
+        file_md5: input.file_hash.unwrap(),
+        source_sha256: sha256(source),
+        repository: input.url.unwrap(),
+        revision: revision.into(),
+        path: input.file.unwrap(),
+        license: "MIT".into(),
+        selected_license: "MIT".into(),
+        review: "Public fixture test only".into(),
+        obligations: Obligations::ArtifactOnly {},
+        artifacts: vec![],
+    };
+    assert_eq!(verify_source(&evidence, 30).unwrap(), source);
+}
