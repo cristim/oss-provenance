@@ -178,6 +178,7 @@ impl Fixture {
 
     fn cli_with_cache(&self, cache: &Path, args: &[&str]) -> Output {
         isolated(Command::new(BINARY))
+            .env_remove("AI_CLEANROOM_CACHE_DIR")
             .arg("--repo")
             .arg(self.path())
             .args(args)
@@ -217,6 +218,16 @@ fn seed_cache(cache: &Path, parts: &[&[u8]], body: &[u8]) {
 fn cache_bytes(cache: &Path) -> BTreeMap<String, Vec<u8>> {
     fs::read_dir(cache)
         .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_str()
+                .is_some_and(|name| {
+                    name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        })
         .map(|entry| {
             let entry = entry.unwrap();
             (

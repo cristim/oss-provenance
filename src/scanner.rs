@@ -756,6 +756,22 @@ mod cache_retry_tests {
         scanner
     }
 
+    fn cache_record_count(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| {
+                        name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+            })
+            .count()
+    }
+
     #[test]
     fn fixture_reads_fragmented_request_bodies() {
         let (endpoint, requests) = server(vec![response("200 OK", "", "")]);
@@ -784,12 +800,11 @@ mod cache_retry_tests {
         let directory = tempfile::tempdir().unwrap();
         let scanner = scanner(endpoint, directory.path());
         scanner.scan("private/old.rs", input).unwrap();
-        let path = std::fs::read_dir(directory.path())
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+        let path = directory.path().join(crate::cache::key(&[
+            b"scanner",
+            scanner.endpoint.as_str().as_bytes(),
+            &Sha256::digest(input),
+        ]));
         let mut before = std::fs::read(&path).unwrap();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -833,15 +848,16 @@ mod cache_retry_tests {
         let directory = tempfile::tempdir().unwrap();
         let scanner = scanner(endpoint, directory.path());
         scanner.scan("source.rs", input).unwrap();
-        let path = std::fs::read_dir(directory.path())
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+        let path = directory.path().join(crate::cache::key(&[
+            b"scanner",
+            scanner.endpoint.as_str().as_bytes(),
+            &Sha256::digest(input),
+        ]));
+        let original = std::fs::read(&path).unwrap();
         std::fs::write(&path, b"broken record").unwrap();
         scanner.scan("source.rs", input).unwrap();
-        let mut record = std::fs::read(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"broken record");
+        let mut record = original;
         record[10..18].copy_from_slice(&0_u64.to_be_bytes());
         std::fs::write(&path, record).unwrap();
         scanner.scan("source.rs", input).unwrap();
@@ -882,7 +898,7 @@ mod cache_retry_tests {
             assert!(format!("{error:#}").contains("retry"));
             assert!(started.elapsed() < Duration::from_secs(1));
             assert_eq!(requests.join().unwrap().len(), 1);
-            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+            assert_eq!(cache_record_count(directory.path()), 0);
         }
     }
 
@@ -896,7 +912,7 @@ mod cache_retry_tests {
             assert!(error.downcast_ref::<ScannerFailure>().is_some());
         }
         assert_eq!(requests.join().unwrap().len(), 2);
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(cache_record_count(directory.path()), 0);
     }
 
     #[test]
@@ -958,7 +974,7 @@ mod cache_retry_tests {
             format!("{error:#}").contains("timeout") || format!("{error:#}").contains("timed out")
         );
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(cache_record_count(directory.path()), 0);
         server.join().unwrap();
     }
 
@@ -993,7 +1009,7 @@ mod cache_retry_tests {
             assert!(error.contains("pause verification"));
             assert!(error.contains("without rewriting code or consuming repair budget"));
             assert_eq!(requests.join().unwrap().len(), 3);
-            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+            assert_eq!(cache_record_count(directory.path()), 0);
         }
     }
 
