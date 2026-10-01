@@ -5,8 +5,9 @@ use oss_provenance::{
     git::{Blob, Scope, Snapshot},
     notices,
     policy::{self, Policy},
-    scanner::Candidate,
+    scanner::{Candidate, ScannerFailure},
 };
+use serde::Serialize;
 use std::{
     collections::BTreeMap,
     fs,
@@ -87,6 +88,34 @@ enum Format {
     Json,
 }
 
+#[derive(Serialize)]
+struct RuntimeError {
+    version: u8,
+    error: RuntimeErrorDetail,
+}
+
+#[derive(Serialize)]
+struct RuntimeErrorDetail {
+    code: ErrorCode,
+    message: String,
+    action: ErrorAction,
+    consumes_repair_attempt: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ErrorCode {
+    ScannerFailure,
+    OperationalError,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ErrorAction {
+    PauseVerification,
+    FixOperationalError,
+}
+
 impl CheckArgs {
     fn scope(&self) -> Result<Scope> {
         match (&self.base, &self.head) {
@@ -103,10 +132,38 @@ impl CheckArgs {
 
 fn main() {
     let cli = Cli::parse();
+    let format = match &cli.command {
+        Commands::Check(args) | Commands::Evaluate(args) => Some(args.format),
+        Commands::Resolve { check, .. } => Some(check.format),
+        Commands::Init | Commands::CollectEvidence { .. } => None,
+    };
     let code = match run(cli) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("oss-provenance: {error:#}");
+            if matches!(format, Some(Format::Json)) {
+                let (code, action) = if error.downcast_ref::<ScannerFailure>().is_some() {
+                    (ErrorCode::ScannerFailure, ErrorAction::PauseVerification)
+                } else {
+                    (
+                        ErrorCode::OperationalError,
+                        ErrorAction::FixOperationalError,
+                    )
+                };
+                let body = RuntimeError {
+                    version: 1,
+                    error: RuntimeErrorDetail {
+                        code,
+                        message: format!("{error:#}"),
+                        action,
+                        consumes_repair_attempt: false,
+                    },
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string(&body).expect("runtime error is serializable")
+                );
+            }
             2
         }
     };
@@ -146,7 +203,9 @@ fn run(cli: Cli) -> Result<i32> {
             let reference = check::admitted_ref(&cli.repo, args.policy_ref.as_deref())?;
             let (snapshot, policy, report) =
                 check::check(&cli.repo, args.scope()?, &reference, args.all, false)?;
-            display(&report, &policy, args.format)?;
+            if matches!(args.format, Format::Text) {
+                display(&report, &policy, args.format)?;
+            }
             if let Some(agent) = agent {
                 let brief = brief.context(
                     "isolated rewrite requires --brief with independent behavioral requirements",
@@ -163,8 +222,12 @@ fn run(cli: Cli) -> Result<i32> {
                         Agent::Codex => "codex",
                     },
                 )?;
+                if matches!(args.format, Format::Json) {
+                    display(&report, &policy, args.format)?;
+                }
                 eprintln!(
-                    "Prepared isolated rewrite handoff. Automatic agent execution and sandboxed candidate tests are not enabled on this platform; findings remain blocked."
+                    "Prepared isolated rewrite handoff at {}. Automatic agent execution and sandboxed candidate tests are not enabled on this platform; findings remain blocked.",
+                    output.display()
                 );
                 return Ok(1);
             }
@@ -178,10 +241,18 @@ fn run(cli: Cli) -> Result<i32> {
             );
             let proposal =
                 resolve_notices(&snapshot, &policy, &report, &description, output.as_deref())?;
-            println!(
+            if matches!(args.format, Format::Json) {
+                display(&report, &policy, args.format)?;
+            }
+            let message = format!(
                 "Notice proposal: {}. Review notices.patch, apply it with git apply --check -p2 then git apply -p2, stage the exact changed paths, and rerun check. The repository was not modified.",
                 proposal.display()
             );
+            if matches!(args.format, Format::Json) {
+                eprintln!("{message}");
+            } else {
+                println!("{message}");
+            }
             Ok(1)
         }
         Commands::CollectEvidence {

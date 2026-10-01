@@ -11,6 +11,17 @@ use std::time::Duration;
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_WFP_BYTES: usize = 64 * 1024;
 
+#[derive(Debug)]
+pub struct ScannerFailure;
+
+impl std::fmt::Display for ScannerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SCANOSS verification unavailable; pause verification and inspect the cause without rewriting code or consuming repair budget")
+    }
+}
+
+impl std::error::Error for ScannerFailure {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Candidate {
     pub id: String,
@@ -109,10 +120,8 @@ impl Scanner {
                 candidates,
             });
         }
-        let body = self.request(&fp.wfp).context(
-            "SCANOSS verification unavailable; pause verification and retry later without rewriting code or consuming repair budget",
-        )?;
-        let candidates = parse_response(&body, &wire_id, fp.line_count)?;
+        let body = self.request(&fp.wfp).context(ScannerFailure)?;
+        let candidates = parse_response(&body, &wire_id, fp.line_count).context(ScannerFailure)?;
         self.cache.store(&key, &body)?;
         Ok(ScanResult {
             fingerprintable,
@@ -633,7 +642,8 @@ mod tests {
             ("200 OK", "{}"),
             ("200 OK", "not-json"),
         ] {
-            assert!(request(status, body.to_owned(), b"short").0.is_err());
+            let error = request(status, body.to_owned(), b"short").0.unwrap_err();
+            assert!(error.downcast_ref::<ScannerFailure>().is_some());
         }
     }
 }
@@ -881,8 +891,10 @@ mod cache_retry_tests {
         let (endpoint, requests) = server(vec![response("200 OK", "", "not JSON"); 2]);
         let directory = tempfile::tempdir().unwrap();
         let scanner = scanner(endpoint, directory.path());
-        assert!(scanner.scan("source.rs", b"input").is_err());
-        assert!(scanner.scan("source.rs", b"input").is_err());
+        for _ in 0..2 {
+            let error = scanner.scan("source.rs", b"input").unwrap_err();
+            assert!(error.downcast_ref::<ScannerFailure>().is_some());
+        }
         assert_eq!(requests.join().unwrap().len(), 2);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }

@@ -258,6 +258,71 @@ fn exit(output: &Output, expected: i32) {
     );
 }
 
+fn json_error(output: &Output, code: &str, action: &str, message: &str) {
+    exit(output, 2);
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["version"], 1);
+    assert_eq!(body["error"]["code"], code);
+    assert_eq!(body["error"]["action"], action);
+    assert_eq!(body["error"]["consumes_repair_attempt"], false);
+    assert!(body["error"]["message"].as_str().unwrap().contains(message));
+    assert_eq!(body.as_object().unwrap().len(), 2);
+    assert!(String::from_utf8_lossy(&output.stderr).contains(message));
+}
+
+fn cached_public_match(allowed: bool) -> (Fixture, TempDir) {
+    let mut fixture = Fixture::new();
+    fixture.policy.scanner.endpoint = "https://127.0.0.1:1/scan".into();
+    fixture.policy.scanner.timeout_secs = 1;
+    if !allowed {
+        fixture.policy.allow.clear();
+        fixture.policy.deny.push("MIT".into());
+    }
+    fixture.policy_bytes = toml::to_string(&fixture.policy).unwrap().into_bytes();
+    fixture.stage(policy::POLICY_PATH, &fixture.policy_bytes);
+    fixture.commit();
+    fixture.reference = fixture.git(&["rev-parse", "HEAD"]);
+    fixture.stage("source.py", PUBLIC_SOURCE);
+
+    let cache = tempfile::tempdir().unwrap();
+    let content_hash = Sha256::digest(PUBLIC_SOURCE);
+    let wire_id = format!("source_{content_hash:x}");
+    let evidence = &fixture.policy.evidence[0];
+    let scan = serde_json::json!({wire_id: [{
+        "id": "snippet",
+        "lines": "1-2",
+        "oss_lines": "1-2",
+        "url": evidence.repository,
+        "file": evidence.path,
+        "file_hash": evidence.file_md5,
+        "licenses": [{"name": "MIT"}]
+    }]});
+    seed_cache(
+        cache.path(),
+        &[
+            b"scanner",
+            fixture.policy.scanner.endpoint.as_bytes(),
+            &content_hash,
+        ],
+        &serde_json::to_vec(&scan).unwrap(),
+    );
+    let raw_url = format!(
+        "https://raw.githubusercontent.com/scanoss/scanoss.py/{}/{}",
+        evidence.revision, evidence.path
+    );
+    seed_cache(
+        cache.path(),
+        &[
+            b"source",
+            raw_url.as_bytes(),
+            evidence.source_sha256.as_bytes(),
+            evidence.file_md5.as_bytes(),
+        ],
+        PUBLIC_SOURCE,
+    );
+    (fixture, cache)
+}
+
 #[test]
 fn fixture_children_ignore_inherited_repository_environment() {
     let target = Fixture::new();
@@ -376,53 +441,9 @@ fn missing_notice_then_deterministic_virtual_proposal_clears_admitted_match() {
 
 #[test]
 fn cli_cached_match_still_requires_notices_and_current_policy_permission() {
-    let mut fixture = Fixture::new();
-    fixture.policy.scanner.endpoint = "https://127.0.0.1:1/scan".into();
-    fixture.policy.scanner.timeout_secs = 1;
-    fixture.policy_bytes = toml::to_string(&fixture.policy).unwrap().into_bytes();
-    fixture.stage(policy::POLICY_PATH, &fixture.policy_bytes);
-    fixture.commit();
-    fixture.reference = fixture.git(&["rev-parse", "HEAD"]);
-
-    let cache = tempfile::tempdir().unwrap();
-    let content_hash = Sha256::digest(PUBLIC_SOURCE);
-    let wire_id = format!("source_{content_hash:x}");
-    let evidence = &fixture.policy.evidence[0];
-    let scan = serde_json::json!({wire_id: [{
-        "id": "snippet",
-        "lines": "1-2",
-        "oss_lines": "1-2",
-        "url": evidence.repository,
-        "file": evidence.path,
-        "file_hash": evidence.file_md5,
-        "licenses": [{"name": "MIT"}]
-    }]});
-    seed_cache(
-        cache.path(),
-        &[
-            b"scanner",
-            fixture.policy.scanner.endpoint.as_bytes(),
-            &content_hash,
-        ],
-        &serde_json::to_vec(&scan).unwrap(),
-    );
-    let raw_url = format!(
-        "https://raw.githubusercontent.com/scanoss/scanoss.py/{}/{}",
-        evidence.revision, evidence.path
-    );
-    seed_cache(
-        cache.path(),
-        &[
-            b"source",
-            raw_url.as_bytes(),
-            evidence.source_sha256.as_bytes(),
-            evidence.file_md5.as_bytes(),
-        ],
-        PUBLIC_SOURCE,
-    );
+    let (mut fixture, cache) = cached_public_match(true);
     let seeded = cache_bytes(cache.path());
     assert_eq!(seeded.len(), 2);
-    fixture.stage("source.py", PUBLIC_SOURCE);
     let (code, first) = cached_check(&fixture, cache.path());
     assert_eq!(code, 1);
     assert_eq!(
@@ -820,8 +841,12 @@ fn candidate_policy_cannot_admit_its_own_permissions() {
 fn cli_requires_admission_and_evaluation_never_passes_or_admits() {
     let fixture = Fixture::new();
     let missing = fixture.cli(&["check", "--staged", "--format", "json"]);
-    exit(&missing, 2);
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("no admitted policy"));
+    json_error(
+        &missing,
+        "operational_error",
+        "fix_operational_error",
+        "no admitted policy",
+    );
     let evaluated = fixture.cli(&[
         "evaluate",
         "--all",
@@ -836,11 +861,160 @@ fn cli_requires_admission_and_evaluation_never_passes_or_admits() {
     exit(&evaluated, 1);
     let json: serde_json::Value = serde_json::from_slice(&evaluated.stdout).unwrap();
     assert_eq!(json["evaluation_only"], true);
-    exit(&fixture.cli(&["check", "--staged"]), 2);
+    json_error(
+        &fixture.cli(&["evaluate", "--format", "json"]),
+        "operational_error",
+        "fix_operational_error",
+        "maintenance evaluation requires --all",
+    );
+    let text_error = fixture.cli(&["check", "--staged"]);
+    exit(&text_error, 2);
+    assert!(text_error.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&text_error.stderr).contains("no admitted policy"));
     exit(
         &fixture.cli(&["evaluate", "--policy-ref", &fixture.reference]),
         2,
     );
+}
+
+#[test]
+fn cli_json_scanner_outage_and_cache_setup_failures_are_distinct() {
+    let (fixture, _) = cached_public_match(true);
+    let empty_cache = tempfile::tempdir().unwrap();
+    let args = [
+        "check",
+        "--staged",
+        "--policy-ref",
+        &fixture.reference,
+        "--format",
+        "json",
+    ];
+    json_error(
+        &fixture.cli_with_cache(empty_cache.path(), &args),
+        "scanner_failure",
+        "pause_verification",
+        "SCANOSS",
+    );
+    let cache_file = empty_cache.path().join("not-a-directory");
+    fs::write(&cache_file, b"cache path is a file").unwrap();
+    json_error(
+        &fixture.cli_with_cache(&cache_file, &args),
+        "operational_error",
+        "fix_operational_error",
+        "cache",
+    );
+}
+
+#[test]
+fn cli_json_resolve_errors_replace_completed_report() {
+    let (fixture, cache) = cached_public_match(true);
+    json_error(
+        &fixture.cli_with_cache(
+            cache.path(),
+            &[
+                "resolve",
+                "--staged",
+                "--policy-ref",
+                &fixture.reference,
+                "--format",
+                "json",
+                "--agent",
+                "codex",
+            ],
+        ),
+        "operational_error",
+        "fix_operational_error",
+        "isolated rewrite requires --brief",
+    );
+    json_error(
+        &fixture.cli_with_cache(
+            cache.path(),
+            &[
+                "resolve",
+                "--staged",
+                "--policy-ref",
+                &fixture.reference,
+                "--format",
+                "json",
+                "--description",
+                " ",
+            ],
+        ),
+        "operational_error",
+        "fix_operational_error",
+        "notice description cannot be empty",
+    );
+    let text_error = fixture.cli_with_cache(
+        cache.path(),
+        &[
+            "resolve",
+            "--staged",
+            "--policy-ref",
+            &fixture.reference,
+            "--description",
+            " ",
+        ],
+    );
+    exit(&text_error, 2);
+    assert!(String::from_utf8_lossy(&text_error.stdout).starts_with("Policy "));
+    assert!(
+        String::from_utf8_lossy(&text_error.stderr).contains("notice description cannot be empty")
+    );
+}
+
+#[test]
+fn cli_json_resolve_success_keeps_one_report_and_paths_on_stderr() {
+    let (fixture, cache) = cached_public_match(true);
+    let output_root = tempfile::tempdir().unwrap();
+    let proposal = output_root.path().join("proposal");
+    let result = fixture.cli_with_cache(
+        cache.path(),
+        &[
+            "resolve",
+            "--staged",
+            "--policy-ref",
+            &fixture.reference,
+            "--format",
+            "json",
+            "--output",
+            proposal.to_str().unwrap(),
+        ],
+    );
+    exit(&result, 1);
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        report["files"][0]["findings"][0]["status"],
+        "notice_required"
+    );
+    assert!(proposal.join("notices.patch").exists());
+    assert!(String::from_utf8_lossy(&result.stderr).contains(proposal.to_str().unwrap()));
+
+    let (blocked, cache) = cached_public_match(false);
+    let brief = output_root.path().join("brief.md");
+    fs::write(&brief, "Implement the independently specified behavior.\n").unwrap();
+    let handoff = output_root.path().join("handoff");
+    let result = blocked.cli_with_cache(
+        cache.path(),
+        &[
+            "resolve",
+            "--staged",
+            "--policy-ref",
+            &blocked.reference,
+            "--format",
+            "json",
+            "--agent",
+            "codex",
+            "--brief",
+            brief.to_str().unwrap(),
+            "--output",
+            handoff.to_str().unwrap(),
+        ],
+    );
+    exit(&result, 1);
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["files"][0]["findings"][0]["status"], "blocked");
+    assert!(handoff.join("handoff.json").exists());
+    assert!(String::from_utf8_lossy(&result.stderr).contains(handoff.to_str().unwrap()));
 }
 
 #[cfg(unix)]
