@@ -6,5 +6,6 @@ pub mod fingerprint;
 pub mod git;
 pub mod notices;
 pub mod policy;
+pub mod process;
 pub mod repair;
 pub mod scanner;
