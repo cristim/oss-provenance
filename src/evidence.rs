@@ -6,7 +6,10 @@ use reqwest::{Url, blocking::Client};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
@@ -502,13 +505,51 @@ pub fn collect_with_scancode_report(
     report: &[u8],
     expected_version: &str,
 ) -> Result<Proposal> {
-    collect_inner(candidate, timeout_secs, Some((report, expected_version)))
+    collect_inner(
+        candidate,
+        timeout_secs,
+        Some(ScanCodeInput::Report(report, expected_version)),
+    )
+}
+
+pub fn collect_with_scancode_executable(
+    candidate: &Candidate,
+    timeout_secs: u64,
+    executable: &Path,
+    expected_version: &str,
+) -> Result<Proposal> {
+    ensure!(
+        executable.is_absolute(),
+        "ScanCode executable must be an absolute trusted path"
+    );
+    ensure!(
+        !expected_version.trim().is_empty(),
+        "ScanCode version must be pinned explicitly"
+    );
+    let executable = executable
+        .canonicalize()
+        .context("resolving trusted ScanCode executable")?;
+    let metadata = executable.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+        "ScanCode executable must be a regular executable file"
+    );
+    collect_inner(
+        candidate,
+        timeout_secs,
+        Some(ScanCodeInput::Executable(&executable, expected_version)),
+    )
+}
+
+enum ScanCodeInput<'a> {
+    Report(&'a [u8], &'a str),
+    Executable(&'a Path, &'a str),
 }
 
 fn collect_inner(
     candidate: &Candidate,
     timeout_secs: u64,
-    scancode: Option<(&[u8], &str)>,
+    scancode: Option<ScanCodeInput<'_>>,
 ) -> Result<Proposal> {
     let mut download = Download::new(timeout_secs)?;
     collect_with_fetch(candidate, scancode, |url| download.get_page(url))
@@ -516,7 +557,7 @@ fn collect_inner(
 
 fn collect_with_fetch(
     candidate: &Candidate,
-    scancode: Option<(&[u8], &str)>,
+    scancode: Option<ScanCodeInput<'_>>,
     mut fetch: impl FnMut(Url) -> Result<Page>,
 ) -> Result<Proposal> {
     let mut proposal = Proposal {
@@ -582,6 +623,15 @@ fn collect_with_fetch(
             None
         }
     };
+    let generated_report;
+    let scancode = match scancode {
+        Some(ScanCodeInput::Report(report, version)) => Some((report, version)),
+        Some(ScanCodeInput::Executable(executable, version)) => {
+            generated_report = run_scancode(executable, &files)?;
+            Some((generated_report.as_slice(), version))
+        }
+        None => None,
+    };
     if let Some((report, expected_version)) = scancode {
         let detected = scancode_expressions(report, expected_version, &files)?;
         if let Some(detection) = detected.get(&identity.path) {
@@ -634,6 +684,61 @@ fn collect_with_fetch(
         );
     }
     Ok(proposal)
+}
+
+fn run_scancode(executable: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>> {
+    let directory = tempfile::tempdir().context("creating private ScanCode directory")?;
+    let root = directory.path().canonicalize()?;
+    let input = root.join("input");
+    let home = root.join("home");
+    let temporary = root.join("tmp");
+    for path in [&input, &home, &temporary] {
+        std::fs::create_dir(path)?;
+    }
+    for (path, bytes) in files {
+        policy::safe_path(path)?;
+        let path = input.join(path);
+        std::fs::create_dir_all(path.parent().context("missing artifact parent")?)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .context("materializing ScanCode input without path collisions")?;
+        file.write_all(bytes)?;
+    }
+    let output = crate::process::run(
+        Command::new(executable)
+            .current_dir(&root)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("TMPDIR", &temporary)
+            .args([
+                "--license",
+                "--info",
+                "--strip-root",
+                "--processes",
+                "0",
+                "--quiet",
+                "--no-check-version",
+                "--json",
+                "-",
+            ])
+            .arg(&input),
+        &[],
+        crate::process::Limits {
+            timeout: Duration::from_secs(300),
+            max_output_bytes: MAX_RESPONSE as usize,
+        },
+    )
+    .context("running ScanCode with a 300-second deadline and 8-MiB output limit")?;
+    ensure!(
+        output.status.success(),
+        "ScanCode exited unsuccessfully: {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
 }
 
 fn scancode_expressions(
@@ -711,6 +816,128 @@ fn scancode_expressions(
         "ScanCode report does not cover every collected upstream artifact"
     );
     Ok(expressions)
+}
+
+#[cfg(test)]
+mod scancode_tests {
+    use super::*;
+
+    fn files() -> BTreeMap<String, Vec<u8>> {
+        BTreeMap::from([
+            (
+                "LICENSE".into(),
+                include_bytes!("../LICENSE-NOTICES/scanoss-winnowing/LICENSE").to_vec(),
+            ),
+            (
+                "src/scanoss/winnowing.py".into(),
+                include_bytes!("../LICENSE-NOTICES/scanoss-winnowing/winnowing.py").to_vec(),
+            ),
+        ])
+    }
+
+    const REPORT: &[u8] = include_bytes!("../tests/fixtures/scancode/32.4.1-public-mit.json");
+
+    #[test]
+    fn real_scancode_report_accounts_for_both_public_mit_artifacts() {
+        let expressions = scancode_expressions(REPORT, "32.4.1", &files()).unwrap();
+        assert_eq!(expressions.len(), 2);
+        assert_eq!(expressions["LICENSE"], "MIT");
+        assert_eq!(expressions["src/scanoss/winnowing.py"], "MIT");
+        assert!(scancode_expressions(REPORT, "32.4.0", &files()).is_err());
+        let mut changed = files();
+        changed.get_mut("LICENSE").unwrap().push(b' ');
+        assert!(scancode_expressions(REPORT, "32.4.1", &changed).is_err());
+    }
+
+    #[test]
+    fn trusted_executable_gets_fixed_arguments_and_only_private_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("scanner");
+        std::fs::write(directory.path().join("report.json"), REPORT).unwrap();
+        std::fs::write(&executable, br##"#!/bin/sh
+set -eu
+[ "$#" = 10 ] || exit 21
+[ "$*" = "--license --info --strip-root --processes 0 --quiet --no-check-version --json - $PWD/input" ] || exit 22
+[ "$HOME" = "$PWD/home" ] || exit 23
+[ "$TMPDIR" = "$PWD/tmp" ] || exit 24
+[ "$PATH" = /usr/bin:/bin ] || exit 25
+[ -z "${USER+x}${PYTHONPATH+x}${PYTHONHOME+x}" ] || exit 26
+[ -f "$PWD/input/LICENSE" ] || exit 27
+[ -f "$PWD/input/src/scanoss/winnowing.py" ] || exit 28
+[ ! -x "$PWD/input/src/scanoss/winnowing.py" ] || exit 29
+/bin/cat "${0%/*}/report.json"
+"##).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let report = run_scancode(&executable, &files()).unwrap();
+        assert_eq!(report, REPORT);
+        assert_eq!(
+            scancode_expressions(&report, "32.4.1", &files())
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(run_scancode(Path::new("/usr/bin/false"), &files()).is_err());
+    }
+
+    #[test]
+    fn scancode_output_limit_and_materialization_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("scanner");
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\n/bin/dd if=/dev/zero bs=1048576 count=9 2>/dev/null\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = run_scancode(&executable, &files()).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<crate::process::ProcessFailure>(),
+            Some(&crate::process::ProcessFailure::OutputLimit)
+        );
+        for invalid in [
+            BTreeMap::from([("../outside".into(), b"bad".to_vec())]),
+            BTreeMap::from([
+                ("LICENSE".into(), b"a".to_vec()),
+                ("LICENSE/NOTICE".into(), b"b".to_vec()),
+            ]),
+        ] {
+            assert!(run_scancode(&executable, &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn scancode_failure_preserves_the_tool_diagnostic() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("scanner");
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\nprintf 'native libmagic unavailable\\n' >&2\nexit 7\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = run_scancode(&executable, &files()).unwrap_err();
+        assert!(error.to_string().contains("native libmagic unavailable"));
+    }
+
+    #[test]
+    #[ignore = "requires explicit SCANCODE_EXECUTABLE; scans only generated hostile-script test data"]
+    fn live_scancode_reads_python_startup_source_without_execution() {
+        let executable = std::env::var_os("SCANCODE_EXECUTABLE")
+            .expect("set an absolute trusted SCANCODE_EXECUTABLE");
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("executed");
+        let source = format!(
+            "# SPDX-License-Identifier: MIT\nfrom pathlib import Path\nPath({}).write_text('executed')\n",
+            serde_json::to_string(marker.to_str().unwrap()).unwrap()
+        );
+        let files = BTreeMap::from([("sitecustomize.py".into(), source.into_bytes())]);
+        let report = run_scancode(Path::new(&executable), &files).unwrap();
+        assert!(!marker.exists());
+        assert_eq!(
+            scancode_expressions(&report, "32.4.1", &files).unwrap()["sitecustomize.py"],
+            "MIT"
+        );
+    }
 }
 
 #[cfg(test)]
