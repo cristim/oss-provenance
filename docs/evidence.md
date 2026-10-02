@@ -22,4 +22,14 @@ Downloads use only `api.github.com`, `raw.githubusercontent.com` and `gitlab.com
 
 The verified tool environment uses [ScanCode Toolkit 32.4.1](https://pypi.org/project/scancode-toolkit/32.4.1/), Python 3.12.14, and Click 8.2.1. Click 8.5.0 caused this ScanCode release to reject its strip-root options in the observed environment. On macOS ARM64, installation also required ICU and libmagic. Keep the tool environment separate from the repository; the executable is trusted operator code. The caller must reject executable paths inside the candidate repository or its Git common directory. Run the actual consumer explicitly with `SCANCODE_EXECUTABLE=/absolute/path/to/scancode cargo test --test evidence live_scancode_collects_public_reference_as_pending_proposal -- --ignored`.
 
+The CLI enforces those executable boundaries, including when invoked from a repository subdirectory or linked worktree:
+
+```sh
+oss-provenance collect-evidence --report findings.json --finding 0 \
+  --scancode-executable /absolute/path/to/scancode --scancode-version 32.4.1 \
+  --output /path/to/new-evidence-directory
+```
+
+Use `--scancode-report /path/to/report.json` instead to import an existing report. Both modes require `--scancode-version`; they cannot be combined. Without either ScanCode input, ordinary collection still works. A successful collection exits 1 because its saved proposal is pending review. Exercise the CLI with `SCANCODE_EXECUTABLE=/absolute/path/to/scancode cargo test --test evidence live_cli_scancode_writes_a_pending_proposal -- --ignored`.
+
 Run the public-reference download test explicitly with `cargo test --test evidence live_public_reference_collects_actual_grant_bytes -- --ignored`. Ordinary tests do not use the network.

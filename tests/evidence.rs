@@ -1,6 +1,199 @@
 use oss_provenance::{evidence::collect, scanner::Candidate};
 use serde_json::json;
 
+fn isolated(mut command: std::process::Command) -> std::process::Command {
+    let keys: Vec<_> = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(command.get_envs().map(|(key, _)| key.to_owned()))
+        .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+        .collect();
+    for key in keys {
+        command.env_remove(key);
+    }
+    command
+}
+
+#[test]
+fn boundary_fixture_preserves_inherited_git_repository() {
+    use std::{fs, process::Command};
+    let sentinel = tempfile::tempdir().unwrap();
+    assert!(
+        isolated(Command::new("git"))
+            .args(["init", "--quiet"])
+            .arg(sentinel.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(sentinel.path().join("source.txt"), b"sentinel\n").unwrap();
+    assert!(
+        isolated(Command::new("git"))
+            .arg("-C")
+            .arg(sentinel.path())
+            .args(["add", "source.txt"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let metadata = ["config", "HEAD", "index"].map(|name| {
+        let path = sentinel.path().join(".git").join(name);
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    });
+    let result = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cli_rejects_tools_inside_git_boundaries_before_reading_the_report",
+            "--nocapture",
+        ])
+        .env("GIT_DIR", sentinel.path().join(".git"))
+        .env("GIT_WORK_TREE", sentinel.path())
+        .env("GIT_INDEX_FILE", sentinel.path().join(".git/index"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for (path, bytes) in metadata {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn cli_rejects_tools_inside_git_boundaries_before_reading_the_report() {
+    use std::{fs, process::Command};
+    let directory = tempfile::tempdir().unwrap();
+    let repo = directory.path().join("repo");
+    let common = directory.path().join("git-data");
+    assert!(
+        isolated(Command::new("git"))
+            .args(["init", "--quiet", "--separate-git-dir"])
+            .arg(&common)
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let subdir = repo.join("subdir");
+    fs::create_dir(&subdir).unwrap();
+    let sentinel = directory.path().join("executed");
+    let script = format!(
+        "#!/bin/sh\nprintf executed > '{}'\n",
+        sentinel.to_str().unwrap().replace('\'', "'\\''")
+    );
+    let tool = repo.join("scancode");
+    fs::write(&tool, &script).unwrap();
+    let common_tool = common.join("scancode");
+    fs::write(&common_tool, &script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&tool, &common_tool] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    let mut paths = vec![
+        tool.clone(),
+        common_tool,
+        std::path::PathBuf::from("relative-tool"),
+    ];
+    #[cfg(unix)]
+    {
+        let link = directory.path().join("external-link");
+        std::os::unix::fs::symlink(&tool, &link).unwrap();
+        paths.push(link);
+    }
+    for path in paths {
+        let output_path = directory.path().join("proposal");
+        let result = isolated(Command::new(env!("CARGO_BIN_EXE_oss-provenance")))
+            .arg("--repo")
+            .arg(&subdir)
+            .args([
+                "collect-evidence",
+                "--report",
+                "absent-report.json",
+                "--output",
+            ])
+            .arg(&output_path)
+            .arg("--scancode-executable")
+            .arg(path)
+            .args(["--scancode-version", "32.4.1"])
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(2));
+        let error = String::from_utf8(result.stderr).unwrap();
+        assert!(error.contains("ScanCode executable must be"), "{error}");
+        assert!(!output_path.exists());
+        assert!(!sentinel.exists());
+    }
+}
+
+#[test]
+#[ignore = "requires explicit SCANCODE_EXECUTABLE and downloads only the pinned public MIT reference"]
+fn live_cli_scancode_writes_a_pending_proposal() {
+    use md5::{Digest, Md5};
+    use std::{fs, process::Command};
+    let executable = std::env::var_os("SCANCODE_EXECUTABLE")
+        .expect("set an absolute trusted SCANCODE_EXECUTABLE");
+    let mut input = candidate();
+    input.file_hash = Some(format!(
+        "{:x}",
+        Md5::digest(include_bytes!(
+            "../LICENSE-NOTICES/scanoss-winnowing/winnowing.py"
+        ))
+    ));
+    let directory = tempfile::tempdir().unwrap();
+    let report = directory.path().join("report.json");
+    fs::write(
+        &report,
+        serde_json::to_vec(&json!({
+            "files": [{"findings": [{"candidate": input}]}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = directory.path().join("proposal");
+    let result = isolated(Command::new(env!("CARGO_BIN_EXE_oss-provenance")))
+        .args([
+            "--repo",
+            env!("CARGO_MANIFEST_DIR"),
+            "collect-evidence",
+            "--report",
+        ])
+        .arg(&report)
+        .arg("--output")
+        .arg(&output)
+        .arg("--scancode-executable")
+        .arg(executable)
+        .args(["--scancode-version", "32.4.1"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        result.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let proposal: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("proposal.json")).unwrap()).unwrap();
+    assert_eq!(proposal["evidence"]["license"], "MIT");
+    assert!(
+        proposal["evidence"]["review"]
+            .as_str()
+            .unwrap()
+            .starts_with("PENDING:")
+    );
+    assert_eq!(proposal["evidence"]["obligations"]["kind"], "unsupported");
+    assert!(
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .contains("not admitted")
+    );
+}
+
 fn candidate() -> Candidate {
     Candidate {
         id: "file".into(),

@@ -53,9 +53,21 @@ enum Commands {
         finding: usize,
         #[arg(long)]
         output: PathBuf,
-        #[arg(long)]
+        #[arg(
+            long,
+            group = "scancode_input",
+            requires = "scancode_version",
+            conflicts_with = "scancode_executable"
+        )]
         scancode_report: Option<PathBuf>,
-        #[arg(long, requires = "scancode_report")]
+        #[arg(
+            long,
+            group = "scancode_input",
+            requires = "scancode_version",
+            conflicts_with = "scancode_report"
+        )]
+        scancode_executable: Option<PathBuf>,
+        #[arg(long, requires = "scancode_input")]
         scancode_version: Option<String>,
     },
 }
@@ -296,9 +308,22 @@ fn run(cli: Cli) -> Result<i32> {
             finding,
             output,
             scancode_report,
+            scancode_executable,
             scancode_version,
         } => {
             ensure!(!output.exists(), "evidence output directory already exists");
+            let scancode_executable = scancode_executable
+                .map(|path| -> Result<PathBuf> {
+                    ensure!(path.is_absolute(), "ScanCode executable must be absolute");
+                    let path = fs::canonicalize(path)?;
+                    ensure!(
+                        !path.starts_with(oss_provenance::git::repository_root(&cli.repo)?)
+                            && !path.starts_with(oss_provenance::git::common_dir(&cli.repo)?),
+                        "ScanCode executable must be outside the candidate repository and Git common directory"
+                    );
+                    Ok(path)
+                })
+                .transpose()?;
             let value: serde_json::Value = serde_json::from_slice(&fs::read(report)?)?;
             let raw = value
                 .get("files")
@@ -319,6 +344,10 @@ fn run(cli: Cli) -> Result<i32> {
                 let version = scancode_version
                     .context("--scancode-version required with --scancode-report")?;
                 evidence::collect_with_scancode_report(&candidate, 30, &fs::read(path)?, &version)?
+            } else if let Some(path) = scancode_executable {
+                let version = scancode_version
+                    .context("--scancode-version required with --scancode-executable")?;
+                evidence::collect_with_scancode_executable(&candidate, 30, &path, &version)?
             } else {
                 evidence::collect(&candidate, 30)?
             };
@@ -578,6 +607,50 @@ fn write_proposal(
 mod tests {
     use super::*;
     use oss_provenance::policy::{Artifact, Evidence, Obligations};
+
+    #[test]
+    fn scancode_cli_requires_one_input_and_its_version() {
+        let base = [
+            "oss-provenance",
+            "collect-evidence",
+            "--report",
+            "report.json",
+            "--output",
+            "new-output",
+        ];
+        for flags in [
+            vec![],
+            vec![
+                "--scancode-report",
+                "scan.json",
+                "--scancode-version",
+                "32.4.1",
+            ],
+            vec![
+                "--scancode-executable",
+                "/opt/scancode",
+                "--scancode-version",
+                "32.4.1",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(flags)).is_ok());
+        }
+        for flags in [
+            vec!["--scancode-report", "scan.json"],
+            vec!["--scancode-executable", "/opt/scancode"],
+            vec!["--scancode-version", "32.4.1"],
+            vec![
+                "--scancode-report",
+                "scan.json",
+                "--scancode-executable",
+                "/opt/scancode",
+                "--scancode-version",
+                "32.4.1",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(flags)).is_err());
+        }
+    }
 
     fn fixture() -> (check::Report, Policy) {
         let policy = Policy::parse(policy::EXAMPLE.as_bytes()).unwrap();
