@@ -135,14 +135,24 @@ pub fn check(
         "enrolled full scans require a comparison baseline"
     );
     let snapshot = Snapshot::capture(root, scope)?;
-    let (reference, bytes, policy) = trusted_policy(&snapshot, reference, evaluation)?;
+    let (policy, report) = check_snapshot(&snapshot, reference, all, evaluation)?;
+    Ok((snapshot, policy, report))
+}
+
+pub fn check_snapshot(
+    snapshot: &Snapshot,
+    reference: &str,
+    all: bool,
+    evaluation: bool,
+) -> Result<(Policy, Report)> {
+    let (reference, bytes, policy) = trusted_policy(snapshot, reference, evaluation)?;
     ensure!(
         policy.scanner.enabled,
         "fingerprint transmission is disabled by admitted policy"
     );
     let scanner = Scanner::new(&policy.scanner.endpoint, policy.scanner.timeout_secs)?;
     let report = assess(
-        &snapshot,
+        snapshot,
         &policy,
         &reference,
         &bytes,
@@ -152,7 +162,7 @@ pub fn check(
         |evidence| crate::evidence::verify_source(evidence, policy.scanner.timeout_secs),
     )?;
     snapshot.verify_unchanged()?;
-    Ok((snapshot, policy, report))
+    Ok((policy, report))
 }
 
 #[allow(clippy::too_many_arguments)]

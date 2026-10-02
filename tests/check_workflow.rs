@@ -1038,6 +1038,55 @@ fn cli_json_resolve_success_keeps_one_report_and_paths_on_stderr() {
     assert!(String::from_utf8_lossy(&result.stderr).contains(handoff.to_str().unwrap()));
 }
 
+#[test]
+fn cli_applies_admitted_notices_to_index_without_changing_worktree_bytes() {
+    let (fixture, cache) = cached_public_match(true);
+    fixture.write("source.py", b"UNSTAGED SOURCE SENTINEL\n");
+    fixture.write(notices::MANIFEST_PATH, b"UNTRACKED MANIFEST SENTINEL\n");
+    let result = fixture.cli_with_cache(
+        cache.path(),
+        &[
+            "resolve",
+            "--apply",
+            "--staged",
+            "--policy-ref",
+            &fixture.reference,
+            "--format",
+            "json",
+        ],
+    );
+    exit(&result, 0);
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(report["issues"].as_array().unwrap().is_empty());
+    assert_eq!(
+        report["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "source.py")
+            .unwrap()["status"],
+        "allowed"
+    );
+    assert_eq!(
+        fs::read(fixture.path().join("source.py")).unwrap(),
+        b"UNSTAGED SOURCE SENTINEL\n"
+    );
+    assert_eq!(
+        fs::read(fixture.path().join(notices::MANIFEST_PATH)).unwrap(),
+        b"UNTRACKED MANIFEST SENTINEL\n"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fixture.git(&["show", ":LICENSE-NOTICES/manifest.json"])).unwrap();
+    assert_eq!(manifest["entries"].as_array().unwrap().len(), 1);
+    exit(
+        &fixture.cli_with_cache(
+            cache.path(),
+            &["check", "--staged", "--policy-ref", &fixture.reference],
+        ),
+        0,
+    );
+}
+
 #[cfg(unix)]
 #[test]
 #[ignore = "Explicit public-fixture network verification against the hosted SCANOSS service"]

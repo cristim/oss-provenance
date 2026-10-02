@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use oss_provenance::{
     check, evidence,
-    git::{Blob, Scope, Snapshot},
+    git::{ApplicationStatus, IndexSession, Scope, Snapshot},
     notices,
     policy::{self, Policy},
     scanner::{Candidate, ScannerFailure},
@@ -42,6 +42,8 @@ enum Commands {
         brief: Option<PathBuf>,
         #[arg(long)]
         output: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["agent", "brief", "output"])]
+        apply: bool,
     },
     Init,
     CollectEvidence {
@@ -195,14 +197,31 @@ fn run(cli: Cli) -> Result<i32> {
             agent,
             brief,
             output,
+            apply,
         } => {
             ensure!(
                 args.head.is_none() && args.base.is_none(),
                 "resolve operates on the staged index only"
             );
+            let session = if apply {
+                Some(IndexSession::open(&cli.repo)?)
+            } else {
+                None
+            };
+            if let Some(session) = &session
+                && let Some(status) = session.recover()?
+            {
+                ensure!(
+                    status == ApplicationStatus::Applied,
+                    "previous index application was installed but HEAD or policy changed; inspect its journal"
+                );
+            }
             let reference = check::admitted_ref(&cli.repo, args.policy_ref.as_deref())?;
             let (snapshot, policy, report) =
                 check::check(&cli.repo, args.scope()?, &reference, args.all, false)?;
+            if let Some(session) = &session {
+                session.validate_supported(&snapshot)?;
+            }
             if matches!(args.format, Format::Text) {
                 display(&report, &policy, args.format)?;
             }
@@ -239,8 +258,25 @@ fn run(cli: Cli) -> Result<i32> {
                     .any(|f| f.status == "unresolved" && f.findings.is_empty()),
                 "unsupported coverage must be resolved before writing notices"
             );
-            let proposal =
-                resolve_notices(&snapshot, &policy, &report, &description, output.as_deref())?;
+            let proposed = notices::resolution(&snapshot, &policy, &report, &description)?;
+            if let Some(session) = &session {
+                let candidate = snapshot.overlay(&proposed)?;
+                let (_, verified) = check::check_snapshot(&candidate, &reference, args.all, false)?;
+                ensure!(
+                    verified.passed(),
+                    "proposed notices did not pass unchanged policy and scanner checks"
+                );
+                ensure!(
+                    session.apply(&snapshot, &candidate, &reference)? == ApplicationStatus::Applied,
+                    "index was installed but HEAD or policy changed; inspect application journal"
+                );
+                display(&verified, &policy, args.format)?;
+                eprintln!(
+                    "Applied notices to the Git index. Working-tree files were preserved byte-for-byte."
+                );
+                return Ok(0);
+            }
+            let proposal = write_proposal(&snapshot, &proposed, output.as_deref())?;
             if matches!(args.format, Format::Json) {
                 display(&report, &policy, args.format)?;
             }
@@ -474,85 +510,6 @@ fn render_text(report: &check::Report, policy: &Policy, out: &mut impl Write) ->
         }
     )?;
     Ok(())
-}
-
-fn resolve_notices(
-    snapshot: &Snapshot,
-    policy: &Policy,
-    report: &check::Report,
-    description: &str,
-    output: Option<&Path>,
-) -> Result<PathBuf> {
-    ensure!(
-        !description.trim().is_empty(),
-        "notice description cannot be empty"
-    );
-    let conflicts = notices::validate_existing_readmes(&snapshot.files)?;
-    ensure!(
-        conflicts.is_empty(),
-        "preserve existing README edits before resolution: {}",
-        conflicts.join("; ")
-    );
-    let mut manifest = notices::load(&snapshot.files)?;
-    notices::reconcile_retirements(&mut manifest, policy);
-    for file in &report.files {
-        for finding in &file.findings {
-            if finding.status != "notice_required" {
-                continue;
-            }
-            let evidence = policy
-                .evidence_for(
-                    finding
-                        .candidate
-                        .file_hash
-                        .as_deref()
-                        .context("missing source identity")?,
-                )
-                .context("missing admitted evidence")?;
-            let bytes = &snapshot.files[&file.path].bytes;
-            for (start, end) in &finding.candidate.local_ranges {
-                notices::upsert(
-                    &mut manifest,
-                    evidence,
-                    &file.path,
-                    *start,
-                    *end,
-                    bytes,
-                    description,
-                )?;
-            }
-        }
-    }
-    let mut proposed = notices::proposed_files(&manifest)?;
-    for entry in &manifest.entries {
-        for artifact in &entry.evidence.artifacts {
-            let bytes = snapshot
-                .read_at(&report.policy_ref, &artifact.path)?
-                .context("admitted artifact unavailable")?;
-            policy::verify_artifact(artifact, &bytes)?;
-            if let Some(existing) = proposed.insert(artifact.path.clone(), bytes.clone()) {
-                ensure!(existing == bytes, "artifact collision");
-            }
-        }
-    }
-    let mut candidate = Snapshot::capture(&snapshot.root, Scope::Staged { all: false })?;
-    for (path, bytes) in &proposed {
-        candidate.files.insert(
-            path.clone(),
-            Blob {
-                mode: "100644".into(),
-                oid: policy::sha256(bytes),
-                bytes: bytes.clone(),
-            },
-        );
-    }
-    let issues = notices::validate(&candidate, policy)?;
-    ensure!(
-        issues.is_empty(),
-        "notice resolution cannot clear: {}",
-        issues.join("; ")
-    );
-    write_proposal(snapshot, &proposed, output)
 }
 
 fn write_proposal(
