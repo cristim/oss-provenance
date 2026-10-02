@@ -1,10 +1,96 @@
+use oss_provenance::git::{ApplicationStatus, IndexSession};
 use oss_provenance::git::{LineRange, Scope, Snapshot};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
 struct Repo(TempDir);
+
+#[test]
+fn session_identity_uses_worktree_root() {
+    let repo = Repo::new();
+    repo.write("sub/source.rs", "original\n");
+    repo.commit();
+    let session = IndexSession::open(repo.path()).unwrap();
+    let state_dir = session.state_dir.clone();
+    drop(session);
+    assert_eq!(
+        IndexSession::open(&repo.path().join("sub"))
+            .unwrap()
+            .state_dir,
+        state_dir
+    );
+}
+
+#[test]
+fn application_rejects_changed_admission_and_completed_reversion() {
+    let repo = Repo::new();
+    repo.write("source.rs", "original\n");
+    let reference = repo.commit();
+    repo.git(&["config", "oss-provenance.policy-ref", &reference]);
+    let session = IndexSession::open(repo.path()).unwrap();
+    let before = repo.staged(false);
+    let raw = fs::read(&session.index_path).unwrap();
+    let candidate = before
+        .overlay(&BTreeMap::from([(
+            "source.rs".into(),
+            b"replacement\n".to_vec(),
+        )]))
+        .unwrap();
+    repo.git(&["config", "oss-provenance.policy-ref", "changed-admission"]);
+    assert!(session.apply(&before, &candidate, &reference).is_err());
+    assert_eq!(fs::read(&session.index_path).unwrap(), raw);
+    repo.git(&["config", "oss-provenance.policy-ref", &reference]);
+    assert_eq!(
+        session.apply(&before, &candidate, &reference).unwrap(),
+        ApplicationStatus::Applied
+    );
+    fs::write(&session.index_path, &raw).unwrap();
+    assert!(session.recover_repair().is_err());
+    assert_eq!(fs::read(&session.index_path).unwrap(), raw);
+}
+
+#[test]
+fn linked_worktrees_have_distinct_journals() {
+    let repo = Repo::new();
+    repo.write("source.rs", "original\n");
+    repo.commit();
+    let linked_parent = tempfile::tempdir().unwrap();
+    let linked = linked_parent.path().join("linked");
+    repo.git(&[
+        "worktree",
+        "add",
+        "--detach",
+        linked.to_str().unwrap(),
+        "HEAD",
+    ]);
+    let original = IndexSession::open(repo.path()).unwrap();
+    let other = IndexSession::open(&linked).unwrap();
+    assert_eq!(original.common_dir, other.common_dir);
+    assert_ne!(original.state_dir, other.state_dir);
+    assert_ne!(original.index_path, other.index_path);
+}
+
+#[test]
+fn prepared_index_cannot_silently_replace_an_ancestor_path() {
+    let repo = Repo::new();
+    repo.write("source.rs", "original\n");
+    let reference = repo.commit();
+    let session = IndexSession::open(repo.path()).unwrap();
+    let original = repo.staged(false);
+    let raw = fs::read(&session.index_path).unwrap();
+    let candidate = original
+        .overlay(&BTreeMap::from([(
+            "source.rs/child.rs".into(),
+            b"replacement\n".to_vec(),
+        )]))
+        .unwrap();
+    assert!(session.apply(&original, &candidate, &reference).is_err());
+    assert_eq!(fs::read(&session.index_path).unwrap(), raw);
+    assert_eq!(repo.git(&["ls-files"]), "source.rs");
+}
 
 fn isolated(mut command: Command) -> Command {
     let keys: Vec<_> = std::env::vars_os()
@@ -393,4 +479,133 @@ fn tree_oids_are_supported_without_ancestry_requirements() {
         snapshot.read_at(&head, "source.rs").unwrap(),
         Some(b"two\n".to_vec())
     );
+}
+
+#[test]
+fn transaction_stages_exact_bytes_preserving_worktree_and_executable_mode() {
+    let repo = Repo::new();
+    repo.write("source.rs", "original\n");
+    let reference = repo.commit();
+    repo.git(&["update-index", "--chmod=+x", "source.rs"]);
+    repo.write("source.rs", "unstaged edits\n");
+    repo.write("new.rs", "untracked sentinel\n");
+    repo.git(&["config", "filter.hostile.clean", "false"]);
+    repo.write(".gitattributes", "* filter=hostile\n");
+    let session = IndexSession::open(repo.path()).unwrap();
+    let before = repo.staged(false);
+    session.validate_supported(&before).unwrap();
+    let candidate = before
+        .overlay(&BTreeMap::from([
+            ("source.rs".into(), b"replacement\n".to_vec()),
+            ("new.rs".into(), b"generated\n".to_vec()),
+        ]))
+        .unwrap();
+    assert_eq!(
+        session.apply(&before, &candidate, &reference).unwrap(),
+        ApplicationStatus::Applied
+    );
+    assert_eq!(repo.git(&["show", ":source.rs"]), "replacement");
+    assert_eq!(repo.git(&["show", ":new.rs"]), "generated");
+    assert_eq!(repo.staged(false).files["source.rs"].mode, "100755");
+    assert_eq!(
+        fs::read(repo.path().join("source.rs")).unwrap(),
+        b"unstaged edits\n"
+    );
+    assert_eq!(
+        fs::read(repo.path().join("new.rs")).unwrap(),
+        b"untracked sentinel\n"
+    );
+}
+
+#[test]
+fn transaction_refuses_concurrent_changes_and_foreign_index_lock() {
+    let repo = Repo::new();
+    repo.write("source.rs", "original\n");
+    let reference = repo.commit();
+    let session = IndexSession::open(repo.path()).unwrap();
+    let before = repo.staged(false);
+    let candidate = before
+        .overlay(&BTreeMap::from([(
+            "source.rs".into(),
+            b"replacement\n".to_vec(),
+        )]))
+        .unwrap();
+    let lock = session.index_path.with_file_name("index.lock");
+    fs::write(&lock, b"someone else's lock").unwrap();
+    assert!(session.apply(&before, &candidate, &reference).is_err());
+    assert_eq!(fs::read(&lock).unwrap(), b"someone else's lock");
+    fs::remove_file(&lock).unwrap();
+    repo.write("source.rs", "concurrent staged change\n");
+    repo.git(&["add", "source.rs"]);
+    assert!(session.recover().is_err());
+    assert_eq!(
+        repo.git(&["show", ":source.rs"]),
+        "concurrent staged change"
+    );
+}
+
+#[test]
+fn pending_installation_is_discovered_by_stable_index_identity() {
+    let repo = Repo::new();
+    repo.write("source.rs", "original\n");
+    let reference = repo.commit();
+    let session = IndexSession::open(repo.path()).unwrap();
+    let before = repo.staged(false);
+    let raw = fs::read(&session.index_path).unwrap();
+    let candidate = before
+        .overlay(&BTreeMap::from([(
+            "source.rs".into(),
+            b"replacement\n".to_vec(),
+        )]))
+        .unwrap();
+    session.apply(&before, &candidate, &reference).unwrap();
+    let journal_path = session.state_dir.join("application.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    journal["status"] = "prepared".into();
+    fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    fs::write(&session.index_path, raw).unwrap();
+    let state_dir = session.state_dir.clone();
+    drop(session);
+    let resumed = IndexSession::open(repo.path()).unwrap();
+    assert_eq!(resumed.state_dir, state_dir);
+    assert_eq!(resumed.recover().unwrap(), Some(ApplicationStatus::Applied));
+    assert_eq!(repo.git(&["show", ":source.rs"]), "replacement");
+    journal["status"] = "prepared".into();
+    fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    let installed = fs::read(&resumed.index_path).unwrap();
+    repo.git(&["commit", "--allow-empty", "-m", "ref movement"]);
+    fs::write(&resumed.index_path, installed).unwrap();
+    assert_eq!(
+        resumed.recover().unwrap(),
+        Some(ApplicationStatus::InstalledButConflicted)
+    );
+    assert_eq!(repo.git(&["show", ":source.rs"]), "replacement");
+}
+
+#[test]
+fn unsupported_index_features_are_rejected() {
+    for args in [
+        vec!["update-index", "--assume-unchanged", "source.rs"],
+        vec!["update-index", "--skip-worktree", "source.rs"],
+        vec!["update-index", "--split-index"],
+        vec!["update-index", "--index-version=4"],
+    ] {
+        let repo = Repo::new();
+        repo.write("source.rs", "original\n");
+        repo.commit();
+        repo.git(&args);
+        let session = IndexSession::open(repo.path()).unwrap();
+        assert!(
+            session.validate_supported(&repo.staged(false)).is_err(),
+            "accepted {args:?}"
+        );
+    }
+    let repo = Repo::new();
+    repo.write("source.rs", "original\n");
+    repo.commit();
+    repo.write("pending.rs", "not staged\n");
+    repo.git(&["add", "--intent-to-add", "pending.rs"]);
+    let session = IndexSession::open(repo.path()).unwrap();
+    assert!(session.validate_supported(&repo.staged(false)).is_err());
 }
