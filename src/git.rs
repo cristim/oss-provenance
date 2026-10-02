@@ -39,10 +39,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn capture(root: &Path, scope: Scope) -> Result<Self> {
-        let root_output = git(root, &["rev-parse", "--show-toplevel"])?;
-        let root_text =
-            std::str::from_utf8(&root_output).context("repository root is not UTF-8")?;
-        let root = fs::canonicalize(root_text.strip_suffix('\n').unwrap_or(root_text))?;
+        let root = repository_root(root)?;
         let mut snapshot = Self {
             root,
             baseline: BTreeMap::new(),
@@ -640,16 +637,26 @@ pub struct IndexSession {
     _lock: fs::File,
 }
 
+pub fn repository_root(root: &Path) -> Result<PathBuf> {
+    let output = git(root, &["rev-parse", "--show-toplevel"])?;
+    let text = std::str::from_utf8(&output)?;
+    Ok(fs::canonicalize(text.strip_suffix('\n').unwrap_or(text))?)
+}
+
+pub fn common_dir(root: &Path) -> Result<PathBuf> {
+    let output = git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let text = std::str::from_utf8(&output)?;
+    Ok(fs::canonicalize(text.strip_suffix('\n').unwrap_or(text))?)
+}
+
 impl IndexSession {
     pub fn open(root: &Path) -> Result<Self> {
-        let top = git(root, &["rev-parse", "--show-toplevel"])?;
-        let root = fs::canonicalize(std::str::from_utf8(&top)?.trim_end_matches('\n'))?;
+        let root = repository_root(root)?;
         let index_path = index_path(&root)?;
-        let common = git(
-            &root,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )?;
-        let common_dir = fs::canonicalize(std::str::from_utf8(&common)?.trim_end_matches('\n'))?;
+        let common_dir = common_dir(&root)?;
         let identity = serde_json::to_vec(&(&common_dir, &root, &index_path))?;
         let parent = common_dir.join("ai-cleanroom");
         let state_dir = parent.join(crate::policy::sha256(&identity));

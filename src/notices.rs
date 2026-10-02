@@ -6,6 +6,88 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const MANIFEST_PATH: &str = "LICENSE-NOTICES/manifest.json";
 
+pub fn resolution(
+    snapshot: &Snapshot,
+    policy: &Policy,
+    report: &crate::check::Report,
+    description: &str,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    ensure!(
+        !description.trim().is_empty(),
+        "notice description cannot be empty"
+    );
+    let conflicts = validate_existing_readmes(&snapshot.files)?;
+    ensure!(
+        conflicts.is_empty(),
+        "preserve existing README edits before resolution: {}",
+        conflicts.join("; ")
+    );
+    let mut manifest = load(&snapshot.files)?;
+    reconcile_retirements(&mut manifest, policy);
+    for file in &report.files {
+        for finding in &file.findings {
+            if finding.status != "notice_required" {
+                continue;
+            }
+            let evidence = policy
+                .evidence_for(
+                    finding
+                        .candidate
+                        .file_hash
+                        .as_deref()
+                        .context("missing source identity")?,
+                )
+                .context("missing admitted evidence")?;
+            let bytes = &snapshot.files[&file.path].bytes;
+            for (start, end) in &finding.candidate.local_ranges {
+                upsert(
+                    &mut manifest,
+                    evidence,
+                    &file.path,
+                    *start,
+                    *end,
+                    bytes,
+                    description,
+                )?;
+            }
+        }
+    }
+    let mut proposed = proposed_files(&manifest)?;
+    for entry in &manifest.entries {
+        for artifact in &entry.evidence.artifacts {
+            let bytes = snapshot
+                .read_at(&report.policy_ref, &artifact.path)?
+                .context("admitted artifact unavailable")?;
+            verify_artifact(artifact, &bytes)?;
+            if let Some(existing) = proposed.insert(artifact.path.clone(), bytes.clone()) {
+                ensure!(existing == bytes, "artifact collision");
+            }
+        }
+    }
+    let mut candidate = snapshot.clone();
+    for (path, bytes) in &proposed {
+        candidate.files.insert(
+            path.clone(),
+            Blob {
+                mode: snapshot
+                    .files
+                    .get(path)
+                    .map_or("100644", |blob| blob.mode.as_str())
+                    .into(),
+                oid: sha256(bytes),
+                bytes: bytes.clone(),
+            },
+        );
+    }
+    let issues = validate(&candidate, policy)?;
+    ensure!(
+        issues.is_empty(),
+        "notice resolution cannot clear: {}",
+        issues.join("; ")
+    );
+    Ok(proposed)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {

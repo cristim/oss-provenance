@@ -9,6 +9,22 @@ use tempfile::TempDir;
 struct Repo(TempDir);
 
 #[test]
+fn repository_root_preserves_a_trailing_newline_in_its_name() {
+    let repo = Repo(tempfile::Builder::new().suffix("\n").tempdir().unwrap());
+    repo.git(&["init", "-q"]);
+    repo.write("source.rs", "original\n");
+    repo.git(&["add", "source.rs"]);
+    let snapshot = repo.staged(false);
+    assert_eq!(snapshot.files["source.rs"].bytes, b"original\n");
+    let session = IndexSession::open(repo.path()).unwrap();
+    assert_eq!(session.root, fs::canonicalize(repo.path()).unwrap());
+    assert_eq!(
+        session.common_dir,
+        fs::canonicalize(repo.path().join(".git")).unwrap()
+    );
+}
+
+#[test]
 fn session_identity_uses_worktree_root() {
     let repo = Repo::new();
     repo.write("sub/source.rs", "original\n");
