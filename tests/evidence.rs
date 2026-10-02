@@ -25,6 +25,58 @@ fn missing_metadata_never_turns_scanner_labels_into_grants() {
 }
 
 #[test]
+fn scancode_executable_and_pin_are_validated_before_downloads() {
+    use oss_provenance::evidence::collect_with_scancode_executable;
+    use std::path::Path;
+    let directory = tempfile::tempdir().unwrap();
+    for (path, version) in [
+        (Path::new("scancode"), "32.4.1"),
+        (directory.path(), "32.4.1"),
+        (Path::new("/usr/bin/false"), ""),
+    ] {
+        assert!(collect_with_scancode_executable(&candidate(), 1, path, version).is_err());
+    }
+    let file = directory.path().join("not-executable");
+    std::fs::write(&file, b"data").unwrap();
+    assert!(collect_with_scancode_executable(&candidate(), 1, &file, "32.4.1").is_err());
+}
+
+#[test]
+#[ignore = "requires explicit SCANCODE_EXECUTABLE and downloads only the pinned public MIT reference"]
+fn live_scancode_collects_public_reference_as_pending_proposal() {
+    use oss_provenance::evidence::collect_with_scancode_executable;
+    let executable = std::env::var_os("SCANCODE_EXECUTABLE")
+        .expect("set an absolute trusted SCANCODE_EXECUTABLE");
+    let mut input = candidate();
+    input.file_hash = Some("d58d9e6aad6a8574050df90430ed8ffc".into());
+    let proposal =
+        collect_with_scancode_executable(&input, 60, std::path::Path::new(&executable), "32.4.1")
+            .unwrap();
+    let report = proposal
+        .artifacts
+        .iter()
+        .find(|(path, _)| path.ends_with("/scancode.json"))
+        .unwrap()
+        .1;
+    let report: serde_json::Value = serde_json::from_slice(report).unwrap();
+    assert_eq!(report["headers"][0]["tool_version"], "32.4.1");
+    let evidence = proposal.evidence.unwrap();
+    assert_eq!(evidence.license, "MIT");
+    assert!(evidence.review.starts_with("PENDING:"));
+    assert!(matches!(
+        evidence.obligations,
+        oss_provenance::policy::Obligations::Unsupported { .. }
+    ));
+    assert!(
+        proposal
+            .artifacts
+            .values()
+            .any(|bytes| bytes
+                == include_bytes!("../LICENSE-NOTICES/scanoss-winnowing/winnowing.py"))
+    );
+}
+
+#[test]
 fn unsupported_hosts_credentials_and_paths_are_local_unresolved_results() {
     for url in [
         "http://github.com/o/r",
