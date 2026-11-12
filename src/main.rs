@@ -44,6 +44,8 @@ enum Commands {
         output: Option<PathBuf>,
         #[arg(long, conflicts_with_all = ["agent", "brief", "output"])]
         apply: bool,
+        #[arg(long, requires = "agent", conflicts_with_all = ["brief", "output", "apply"])]
+        repair_config: Option<PathBuf>,
     },
     Init,
     CollectEvidence {
@@ -102,6 +104,8 @@ struct RuntimeErrorDetail {
     message: String,
     action: ErrorAction,
     consumes_repair_attempt: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repair: Option<oss_provenance::repair::Accounting>,
 }
 
 #[derive(Serialize)]
@@ -109,6 +113,7 @@ struct RuntimeErrorDetail {
 enum ErrorCode {
     ScannerFailure,
     OperationalError,
+    RepairFailure,
 }
 
 #[derive(Serialize)]
@@ -116,6 +121,7 @@ enum ErrorCode {
 enum ErrorAction {
     PauseVerification,
     FixOperationalError,
+    PauseRepair,
 }
 
 impl CheckArgs {
@@ -144,7 +150,12 @@ fn main() {
         Err(error) => {
             eprintln!("oss-provenance: {error:#}");
             if matches!(format, Some(Format::Json)) {
-                let (code, action) = if error.downcast_ref::<ScannerFailure>().is_some() {
+                let repair = error
+                    .downcast_ref::<oss_provenance::repair::RepairFailure>()
+                    .map(|failure| failure.accounting.clone());
+                let (code, action) = if repair.is_some() {
+                    (ErrorCode::RepairFailure, ErrorAction::PauseRepair)
+                } else if error.downcast_ref::<ScannerFailure>().is_some() {
                     (ErrorCode::ScannerFailure, ErrorAction::PauseVerification)
                 } else {
                     (
@@ -158,7 +169,10 @@ fn main() {
                         code,
                         message: format!("{error:#}"),
                         action,
-                        consumes_repair_attempt: false,
+                        consumes_repair_attempt: repair
+                            .as_ref()
+                            .is_some_and(|accounting| accounting.consumed_attempts > 0),
+                        repair,
                     },
                 };
                 println!(
@@ -198,11 +212,35 @@ fn run(cli: Cli) -> Result<i32> {
             brief,
             output,
             apply,
+            repair_config,
         } => {
             ensure!(
                 args.head.is_none() && args.base.is_none(),
                 "resolve operates on the staged index only"
             );
+            if let Some(config) = repair_config {
+                ensure!(
+                    matches!(agent, Some(Agent::Claude)),
+                    "automatic Codex execution is unsupported; use an explicit manual handoff"
+                );
+                let result = oss_provenance::repair::run(
+                    &cli.repo,
+                    args.policy_ref.as_deref(),
+                    args.all,
+                    &config,
+                )?;
+                if matches!(args.format, Format::Json) {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!(
+                        "Repair {}; {} of {} unsuccessful attempts. Working-tree files were preserved.",
+                        result.status,
+                        result.accounting.failed_attempts,
+                        result.accounting.max_attempts
+                    );
+                }
+                return Ok(if result.status == "applied" { 0 } else { 1 });
+            }
             let session = if apply {
                 Some(IndexSession::open(&cli.repo)?)
             } else {
@@ -245,7 +283,7 @@ fn run(cli: Cli) -> Result<i32> {
                     display(&report, &policy, args.format)?;
                 }
                 eprintln!(
-                    "Prepared isolated rewrite handoff at {}. Automatic agent execution and sandboxed candidate tests are not enabled on this platform; findings remain blocked.",
+                    "Prepared manual rewrite handoff at {}. Findings remain blocked; automatic Claude execution requires --repair-config.",
                     output.display()
                 );
                 return Ok(1);

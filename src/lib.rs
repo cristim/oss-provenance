@@ -7,4 +7,5 @@ pub mod notices;
 pub mod policy;
 pub mod process;
 pub mod repair;
+pub mod sandbox;
 pub mod scanner;

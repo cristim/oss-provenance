@@ -323,6 +323,666 @@ fn cached_public_match(allowed: bool) -> (Fixture, TempDir) {
     (fixture, cache)
 }
 
+fn repair_fixture_config(inputs: &Path, requirements: &str, test: &str) -> std::path::PathBuf {
+    let image = std::env::var("AI_CLEANROOM_TEST_PROVIDER_IMAGE")
+        .expect("set deterministic fixture image ID");
+    repair_config(inputs, requirements, test, &image)
+}
+
+fn repair_config(inputs: &Path, requirements: &str, test: &str, image: &str) -> std::path::PathBuf {
+    fs::write(inputs.join("requirements.txt"), requirements).unwrap();
+    fs::create_dir(inputs.join("tests")).unwrap();
+    fs::write(inputs.join("tests/test.sh"), format!("set -e\n/usr/local/bin/node -e 'const a=require(\"node:fs\").readFileSync(\"/proc/1/cmdline\",\"utf8\").split(\"\\0\");if(a[0]!==\"/usr/bin/timeout\"||a[1]!==\"--signal=KILL\"||a[2]!==\"60\")process.exit(125)'\n{test}")).unwrap();
+    let config = inputs.join("repair.toml");
+    fs::write(&config, format!("version = 1\nprovider_image = {image:?}\ntest_image = {image:?}\nrequirements = {:?}\ntests = {:?}\ntest_command = [\"/bin/sh\", \"/trusted/test.sh\"]\ntargets = [\"source.py\"]\n", inputs.join("requirements.txt"), inputs.join("tests"))).unwrap();
+    config
+}
+
+fn repair_cli(fixture: &Fixture, cache: &Path, config: &Path) -> Output {
+    repair_command(fixture, cache, config).output().unwrap()
+}
+
+fn repair_command(fixture: &Fixture, cache: &Path, config: &Path) -> Command {
+    let mut command = isolated(Command::new(BINARY));
+    command
+        .arg("--repo")
+        .arg(fixture.path())
+        .args(["resolve", "--agent", "claude", "--repair-config"])
+        .arg(config)
+        .args(["--policy-ref", &fixture.reference, "--format", "json"])
+        .env("OSS_PROVENANCE_CACHE_DIR", cache)
+        .env("ANTHROPIC_API_KEY", "deterministic-local-fixture")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    command
+}
+
+#[test]
+fn repair_cli_rejects_invalid_auth_before_creating_a_container() {
+    for (api_key, oauth) in [
+        (None, None),
+        (Some("dummy-api"), Some("dummy-oauth")),
+        (Some("private-marker\nsecond-line"), None),
+        (None, Some("private-marker\rsecond-line")),
+    ] {
+        let (fixture, cache) = cached_public_match(false);
+        let inputs = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let config = repair_config(
+            inputs.path(),
+            "Implement addition.",
+            "exit 0\n",
+            &format!("sha256:{}", "0".repeat(64)),
+        );
+        let mut command = repair_command(&fixture, cache.path(), &config);
+        command
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .env("TMPDIR", runtime.path());
+        if let Some(value) = api_key {
+            command.env("ANTHROPIC_API_KEY", value);
+        }
+        if let Some(value) = oauth {
+            command.env("CLAUDE_CODE_OAUTH_TOKEN", value);
+        }
+        let output = command.output().unwrap();
+        exit(&output, 2);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("private-marker"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("private-marker"));
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["error"]["repair"]["failed_attempts"], 0);
+        assert_eq!(body["error"]["repair"]["consumed_attempts"], 0);
+        assert_eq!(fs::read_dir(runtime.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+#[ignore = "requires deterministic Docker provider fixture; never uses a real credential"]
+fn repair_cli_keeps_credentials_out_of_container_metadata_after_sigkill() {
+    use oss_provenance::process::{self, Limits};
+    use std::time::{Duration, Instant};
+    const TOKEN: &str = "  local-credential-$value;`tick`'\"\\backslash=checked  ";
+    let docker = |args: &[&str]| {
+        let mut command = Command::new("docker");
+        command
+            .env_clear()
+            .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", std::env::var_os("HOME").unwrap())
+            .args(args);
+        process::run(
+            &mut command,
+            b"",
+            Limits {
+                timeout: Duration::from_secs(5),
+                max_output_bytes: 64 * 1024,
+            },
+        )
+        .unwrap()
+    };
+    for auth in ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"] {
+        let (fixture, cache) = cached_public_match(false);
+        let inputs = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let config = repair_fixture_config(inputs.path(), "CREDENTIAL_METADATA_HOLD", "exit 0\n");
+        let mut child = repair_command(&fixture, cache.path(), &config)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .env(auth, TOKEN)
+            .env("TMPDIR", runtime.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut owned_id = None;
+        let checks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let id = loop {
+                for entry in fs::read_dir(runtime.path()).unwrap().flatten() {
+                    if !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("ai-cleanroom-provider-")
+                    {
+                        continue;
+                    }
+                    if let Ok(id) = fs::read_to_string(entry.path().join("cid")) {
+                        let id = id.trim();
+                        if id.len() == 64
+                            && id
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                        {
+                            owned_id = Some(id.to_owned());
+                        }
+                    }
+                }
+                if let Some(id) = &owned_id {
+                    let ready = docker(&[
+                        "exec",
+                        id,
+                        "/usr/bin/test",
+                        "-f",
+                        "/tmp/credential-transfer-verified",
+                    ]);
+                    if ready.status.success() {
+                        break id.clone();
+                    }
+                }
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "provider exited before credential verification"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "provider did not verify stdin credential transfer"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let children = Command::new("/usr/bin/pgrep")
+                .env_clear()
+                .args(["-P", &child.id().to_string()])
+                .output()
+                .unwrap();
+            assert!(children.status.success());
+            let pids = String::from_utf8(children.stdout).unwrap();
+            for pid in pids.split_whitespace() {
+                let pid: u32 = pid.parse().unwrap();
+                let environment = Command::new("/bin/ps")
+                    .env_clear()
+                    .args(["eww", "-p", &pid.to_string()])
+                    .output()
+                    .unwrap();
+                assert!(environment.status.success());
+                let environment = String::from_utf8(environment.stdout).unwrap();
+                assert!(
+                    environment.contains("docker run"),
+                    "unexpected provider child process"
+                );
+                assert!(
+                    !environment.contains("ANTHROPIC_API_KEY=")
+                        && !environment.contains("CLAUDE_CODE_OAUTH_TOKEN=")
+                        && !environment.contains(TOKEN),
+                    "Docker client inherited authentication"
+                );
+            }
+            for phase in 0..3 {
+                if phase == 1 {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                }
+                if phase == 2 {
+                    assert!(docker(&["kill", &id]).status.success());
+                }
+                let inspected = docker(&["inspect", &id]);
+                assert!(inspected.status.success());
+                let inspected: serde_json::Value =
+                    serde_json::from_slice(&inspected.stdout).unwrap();
+                assert_eq!(inspected[0]["State"]["Running"], phase != 2);
+                assert_eq!(inspected[0]["HostConfig"]["LogConfig"]["Type"], "none");
+                let config = &inspected[0]["Config"];
+                for entry in config["Env"].as_array().unwrap() {
+                    let entry = entry.as_str().unwrap();
+                    assert!(
+                        !entry.starts_with("ANTHROPIC_API_KEY=")
+                            && !entry.starts_with("CLAUDE_CODE_OAUTH_TOKEN="),
+                        "container metadata retained authentication"
+                    );
+                }
+                let escaped = serde_json::to_string(TOKEN).unwrap();
+                assert!(
+                    !config.to_string().contains(&escaped[1..escaped.len() - 1]),
+                    "container configuration retained credential bytes"
+                );
+            }
+        }));
+        if child.try_wait().unwrap().is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        if let Some(id) = owned_id {
+            assert!(docker(&["rm", "--force", &id]).status.success());
+        }
+        if let Err(error) = checks {
+            std::panic::resume_unwind(error);
+        }
+    }
+}
+
+#[test]
+fn repair_cli_rejects_trusted_test_fifo_before_reservation() {
+    let (fixture, cache) = cached_public_match(false);
+    let inputs = tempfile::tempdir().unwrap();
+    let config = repair_config(
+        inputs.path(),
+        "Implement addition.",
+        "exit 0\n",
+        &format!("sha256:{}", "0".repeat(64)),
+    );
+    let fifo = std::ffi::CString::new(inputs.path().join("tests/pipe").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let before = fs::read(fixture.path().join(".git/index")).unwrap();
+    let mut child = repair_command(&fixture, cache.path(), &config)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("repair hung opening a nonregular trusted-test FIFO");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let output = child.wait_with_output().unwrap();
+    exit(&output, 2);
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("bounded regular file"),
+        "{body}"
+    );
+    assert_eq!(body["error"]["consumes_repair_attempt"], false);
+    assert_eq!(fs::read(fixture.path().join(".git/index")).unwrap(), before);
+    let session = oss_provenance::git::IndexSession::open(fixture.path()).unwrap();
+    assert!(!session.state_dir.join("repair.json").exists());
+}
+
+#[test]
+#[ignore = "requires deterministic Docker provider fixture; never uses a real credential"]
+fn repair_cli_reconciles_a_killed_reservation_once() {
+    let (fixture, cache) = cached_public_match(false);
+    let inputs = tempfile::tempdir().unwrap();
+    let config = repair_fixture_config(inputs.path(), "RESERVATION_CRASH", "exit 0\n");
+    let state_path = {
+        let session = oss_provenance::git::IndexSession::open(fixture.path()).unwrap();
+        session.state_dir.join("repair.json")
+    };
+    kill_repair_at_phase(
+        repair_command(&fixture, cache.path(), &config),
+        &state_path,
+        "reserved",
+    );
+    for consumed in [1, 0] {
+        let output = repair_cli(&fixture, cache.path(), &config);
+        exit(&output, 2);
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["error"]["repair"]["failed_attempts"], 1, "{body}");
+        assert_eq!(body["error"]["repair"]["consumed_attempts"], consumed);
+        assert_eq!(body["error"]["repair"]["reserved"], false);
+    }
+}
+
+fn kill_repair_at_phase(mut command: Command, state_path: &Path, phase: &str) {
+    let mut child = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(bytes) = fs::read(state_path) {
+            let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if state["phase"] == phase {
+                break;
+            }
+        }
+        if child.try_wait().unwrap().is_some() || std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not reach durable phase {phase}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+}
+
+#[test]
+#[ignore = "requires deterministic Docker provider fixture; never uses a real credential"]
+fn repair_cli_starts_a_new_job_after_completed_repair() {
+    let (fixture, cache) = cached_public_match(false);
+    let inputs = tempfile::tempdir().unwrap();
+    let config = repair_fixture_config(
+        inputs.path(),
+        "Implement addition.",
+        "test -r /candidate/source.py\n",
+    );
+    let mut replacement = "def add(left, right):\n    return left + right\n".to_owned();
+    for i in 0..64 {
+        replacement.push_str(&format!(
+            "\ndef value_{i}(argument):\n    return argument * {i} + {}\n",
+            i + 1
+        ));
+    }
+    let hash = Sha256::digest(replacement.as_bytes());
+    let wire_id = format!("source_{hash:x}");
+    seed_cache(
+        cache.path(),
+        &[
+            b"scanner",
+            fixture.policy.scanner.endpoint.as_bytes(),
+            &hash,
+        ],
+        &serde_json::to_vec(&serde_json::json!({wire_id:[{"id":"none"}]})).unwrap(),
+    );
+    let directory = oss_provenance::git::IndexSession::open(fixture.path())
+        .unwrap()
+        .state_dir
+        .clone();
+    let state_path = directory.join("repair.json");
+    kill_repair_at_phase(
+        repair_command(&fixture, cache.path(), &config),
+        &state_path,
+        "reserved",
+    );
+    let first = repair_cli(&fixture, cache.path(), &config);
+    exit(&first, 0);
+    let body: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(!body["report"].is_null());
+    assert_eq!(body["accounting"]["failed_attempts"], 1);
+    assert_eq!(body["accounting"]["consumed_attempts"], 1);
+    let first_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let receipt_path = directory.join(format!(
+        "applied-{}.json",
+        first_state["application_id"].as_str().unwrap()
+    ));
+    let receipt_bytes = fs::read(&receipt_path);
+    {
+        let session = oss_provenance::git::IndexSession::open(fixture.path()).unwrap();
+        let snapshot = oss_provenance::git::Snapshot::capture(
+            fixture.path(),
+            oss_provenance::git::Scope::Staged { all: false },
+        )
+        .unwrap();
+        session
+            .apply(&snapshot, &snapshot, &fixture.git(&["rev-parse", "HEAD"]))
+            .unwrap();
+    }
+    fixture.git(&["commit", "-m", "commit first verified replacement"]);
+    fixture.git(&["commit", "--allow-empty", "-m", "later unrelated commit"]);
+    fixture.stage("source.py", PUBLIC_SOURCE);
+    fixture.write("source.py", b"unstaged second-job sentinel\n");
+    fs::write(
+        inputs.path().join("requirements.txt"),
+        "Implement addition for a second independent job.\n",
+    )
+    .unwrap();
+    assert_eq!(cached_check(&fixture, cache.path()).0, 1);
+    let second = repair_cli(&fixture, cache.path(), &config);
+    exit(&second, 0);
+    let body: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert!(!body["report"].is_null());
+    assert_eq!(body["accounting"]["failed_attempts"], 0);
+    assert_eq!(body["accounting"]["consumed_attempts"], 0);
+    let second_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(second_state["job"], 1);
+    assert_ne!(second_state["sessions"], first_state["sessions"]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &fs::read(directory.join("completed-0.json")).unwrap()
+        )
+        .unwrap(),
+        first_state
+    );
+    assert_eq!(fs::read(receipt_path).unwrap(), receipt_bytes.unwrap());
+    assert_eq!(
+        fs::read(fixture.path().join("source.py")).unwrap(),
+        b"unstaged second-job sentinel\n"
+    );
+    fixture.git(&[
+        "commit",
+        "--allow-empty",
+        "-m",
+        "commit second verified replacement",
+    ]);
+    fixture.git(&["commit", "--allow-empty", "-m", "another unrelated commit"]);
+    let repeated = repair_cli(&fixture, cache.path(), &config);
+    exit(&repeated, 0);
+    let body: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert!(body["report"].is_null());
+    assert_eq!(body["accounting"]["failed_attempts"], 0);
+}
+
+#[test]
+#[ignore = "requires deterministic Docker provider fixture; never uses a real credential"]
+fn repair_cli_enforces_ten_failures_across_restarts() {
+    for (requirements, test) in [
+        ("INVALID_CANDIDATE", "exit 0\n"),
+        ("Implement addition.", "exit 1\n"),
+    ] {
+        let (fixture, cache) = cached_public_match(false);
+        let inputs = tempfile::tempdir().unwrap();
+        let config = repair_fixture_config(inputs.path(), requirements, test);
+        let before = fs::read(fixture.path().join(".git/index")).unwrap();
+        let first = repair_cli(&fixture, cache.path(), &config);
+        exit(&first, 1);
+        let body: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+        assert_eq!(body["status"], "exhausted", "{body}");
+        assert_eq!(body["accounting"]["failed_attempts"], 10);
+        assert_eq!(body["accounting"]["consumed_attempts"], 10);
+        let second = repair_cli(&fixture, cache.path(), &config);
+        exit(&second, 1);
+        let body: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+        assert_eq!(body["accounting"]["failed_attempts"], 10);
+        assert_eq!(body["accounting"]["consumed_attempts"], 0);
+        assert_eq!(fs::read(fixture.path().join(".git/index")).unwrap(), before);
+        assert_eq!(
+            fs::read(fixture.path().join("source.py")).unwrap(),
+            PUBLIC_SOURCE
+        );
+        let directory = oss_provenance::git::IndexSession::open(fixture.path())
+            .unwrap()
+            .state_dir
+            .clone();
+        let saved = fs::read(directory.join("repair.json")).unwrap();
+        fixture.stage("other.rs", b"new unrelated staged bytes\n");
+        fs::write(
+            inputs.path().join("requirements.txt"),
+            "A different requirement cannot reset an exhausted job.\n",
+        )
+        .unwrap();
+        let changed = repair_cli(&fixture, cache.path(), &config);
+        exit(&changed, 2);
+        let body: serde_json::Value = serde_json::from_slice(&changed.stdout).unwrap();
+        assert_eq!(body["error"]["repair"]["failed_attempts"], 10);
+        assert_eq!(body["error"]["repair"]["consumed_attempts"], 0);
+        assert_eq!(fs::read(directory.join("repair.json")).unwrap(), saved);
+        assert!(!directory.join("completed-0.json").exists());
+    }
+}
+
+#[test]
+#[ignore = "requires deterministic Docker provider fixture; never uses a real credential"]
+fn repair_cli_provider_outage_preserves_budget_and_contract() {
+    let (fixture, cache) = cached_public_match(false);
+    let inputs = tempfile::tempdir().unwrap();
+    let config = repair_fixture_config(inputs.path(), "PROVIDER_OUTAGE", "exit 0\n");
+    for _ in 0..2 {
+        let output = repair_cli(&fixture, cache.path(), &config);
+        exit(&output, 2);
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["error"]["repair"]["failed_attempts"], 0, "{body}");
+        assert_eq!(body["error"]["repair"]["reserved"], false);
+        assert_eq!(body["error"]["consumes_repair_attempt"], false);
+    }
+    let changed_scope = repair_command(&fixture, cache.path(), &config)
+        .arg("--all")
+        .output()
+        .unwrap();
+    exit(&changed_scope, 2);
+    let body: serde_json::Value = serde_json::from_slice(&changed_scope.stdout).unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("contract")
+    );
+    fs::write(inputs.path().join("tests/test.sh"), "changed\n").unwrap();
+    let output = repair_cli(&fixture, cache.path(), &config);
+    exit(&output, 2);
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("contract")
+    );
+    assert_eq!(body["error"]["repair"]["failed_attempts"], 0);
+}
+
+#[test]
+#[ignore = "requires deterministic Docker provider fixture; never uses a real credential"]
+fn repair_cli_resumes_saved_candidate_after_scanner_outage_or_crash() {
+    for interrupted in [false, true] {
+        let (fixture, cache) = cached_public_match(false);
+        let inputs = tempfile::tempdir().unwrap();
+        let config = repair_fixture_config(
+            inputs.path(),
+            "Implement addition.",
+            "sleep 0.5\ntest -r /candidate/source.py\n",
+        );
+        if !interrupted {
+            let session = oss_provenance::git::IndexSession::open(fixture.path()).unwrap();
+            let original = oss_provenance::git::Snapshot::capture(
+                fixture.path(),
+                oss_provenance::git::Scope::Staged { all: false },
+            )
+            .unwrap();
+            session
+                .apply(&original, &original, &fixture.git(&["rev-parse", "HEAD"]))
+                .unwrap();
+        }
+        fixture.write("source.py", b"unstaged sentinel\n");
+        let original_index = fs::read(fixture.path().join(".git/index")).unwrap();
+        let state_path = {
+            let session = oss_provenance::git::IndexSession::open(fixture.path()).unwrap();
+            session.state_dir.join("repair.json")
+        };
+        if interrupted {
+            kill_repair_at_phase(
+                repair_command(&fixture, cache.path(), &config),
+                &state_path,
+                "test",
+            );
+        } else {
+            let output = repair_cli(&fixture, cache.path(), &config);
+            exit(&output, 2);
+        }
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            state["phase"],
+            if interrupted { "test" } else { "scan" },
+            "{state}"
+        );
+        assert_eq!(state["failed"], 0);
+        assert_eq!(state["sessions"].as_array().unwrap().len(), 1);
+        let files: std::collections::BTreeMap<String, Vec<u8>> =
+            serde_json::from_value(state["candidate"].clone()).unwrap();
+        let replacement = &files["source.py"];
+        let content_hash = Sha256::digest(replacement);
+        let wire_id = format!("source_{content_hash:x}");
+        seed_cache(
+            cache.path(),
+            &[
+                b"scanner",
+                fixture.policy.scanner.endpoint.as_bytes(),
+                &content_hash,
+            ],
+            &serde_json::to_vec(&serde_json::json!({wire_id:[{"id":"none"}]})).unwrap(),
+        );
+        if !interrupted {
+            let original = oss_provenance::git::Snapshot::capture(
+                fixture.path(),
+                oss_provenance::git::Scope::Staged { all: false },
+            )
+            .unwrap();
+            let candidate = original.overlay(&files).unwrap();
+            let mut pending = state.clone();
+            pending["phase"] = "apply".into();
+            pending["application_id"] = oss_provenance::git::IndexSession::application_identity(
+                &original,
+                &candidate,
+                &fixture.git(&["rev-parse", "HEAD"]),
+            )
+            .unwrap()
+            .into();
+            fs::write(&state_path, serde_json::to_vec(&pending).unwrap()).unwrap();
+        }
+        let output = repair_cli(&fixture, cache.path(), &config);
+        exit(&output, 0);
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["status"], "applied", "{body}");
+        assert_eq!(body["accounting"]["consumed_attempts"], 0);
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(after["sessions"], state["sessions"]);
+        assert_eq!(
+            fixture.git(&["show", ":source.py"]).as_bytes(),
+            replacement.strip_suffix(b"\n").unwrap()
+        );
+        assert_eq!(
+            fs::read(fixture.path().join("source.py")).unwrap(),
+            b"unstaged sentinel\n"
+        );
+        let repeated = repair_cli(&fixture, cache.path(), &config);
+        exit(&repeated, 0);
+        for identity in [
+            serde_json::Value::Null,
+            "malformed".into(),
+            "0".repeat(64).into(),
+        ] {
+            let mut corrupted = after.clone();
+            corrupted["application_id"] = identity;
+            fs::write(&state_path, serde_json::to_vec(&corrupted).unwrap()).unwrap();
+            exit(&repair_cli(&fixture, cache.path(), &config), 2);
+        }
+        fs::write(&state_path, serde_json::to_vec(&after).unwrap()).unwrap();
+        fs::rename(&config, inputs.path().join("saved-repair.toml")).unwrap();
+        let missing_config = fixture.cli(&[
+            "resolve",
+            "--agent",
+            "claude",
+            "--repair-config",
+            config.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
+        exit(&missing_config, 0);
+        fixture.git(&["config", "oss-provenance.policy-ref", "changed-admission"]);
+        let conflict = fixture.cli(&[
+            "resolve",
+            "--agent",
+            "claude",
+            "--repair-config",
+            config.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
+        exit(&conflict, 2);
+        let body: serde_json::Value = serde_json::from_slice(&conflict.stdout).unwrap();
+        assert_eq!(
+            body["error"]["repair"]["outcome"], "installed_conflict",
+            "{body}"
+        );
+        fs::write(fixture.path().join(".git/index"), &original_index).unwrap();
+        let reverted = repair_cli(&fixture, cache.path(), &config);
+        exit(&reverted, 2);
+        assert_eq!(
+            fs::read(fixture.path().join(".git/index")).unwrap(),
+            original_index
+        );
+    }
+}
+
 #[test]
 fn fixture_children_ignore_inherited_repository_environment() {
     let target = Fixture::new();

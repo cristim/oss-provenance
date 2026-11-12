@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+const crypto = require('node:crypto');
+let prompt = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { prompt += chunk; });
+process.stdin.on('end', () => {
+  const pidOne = require('node:fs').readFileSync('/proc/1/cmdline', 'utf8').split('\0');
+  if (pidOne[0] !== '/usr/bin/timeout' || pidOne[1] !== '--signal=KILL' || pidOne[2] !== '180') process.exit(2);
+  if (prompt.includes('CREDENTIAL_METADATA_HOLD')) {
+    const credentials = [process.env.ANTHROPIC_API_KEY, process.env.CLAUDE_CODE_OAUTH_TOKEN].filter(Boolean);
+    if (credentials.length !== 1 || credentials[0] !== "  local-credential-$value;`tick`'\"\\backslash=checked  ") process.exit(2);
+    require('node:fs').writeFileSync('/tmp/credential-transfer-verified', 'ready');
+    setInterval(() => {}, 1000);
+    return;
+  }
+  if (prompt.includes('RESERVATION_CRASH')) {
+    setTimeout(() => process.exit(1), 1500);
+    return;
+  }
+  if (prompt.includes('PROVIDER_OUTAGE')) process.exit(1);
+  const session = crypto.randomUUID();
+  const emit = event => process.stdout.write(JSON.stringify(event) + '\n');
+  emit({type:'system', subtype:'init', session_id:session, tools:[], skills:[], mcp_servers:[], slash_commands:[], plugins:[]});
+  let content = 'def add(left, right):\n    return left + right\n';
+  for (let i = 0; i < 64; i++) content += `\ndef value_${i}(argument):\n    return argument * ${i} + ${i + 1}\n`;
+  emit({type:'result', subtype:'success', is_error:false, session_id:session,
+    result:prompt.includes('INVALID_CANDIDATE') ? 'invalid' : JSON.stringify({files:[{path:'source.py', content}]})});
+});

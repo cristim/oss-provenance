@@ -9,6 +9,92 @@ use tempfile::TempDir;
 struct Repo(TempDir);
 
 #[test]
+fn application_identity_includes_captured_admission() {
+    let repo = Repo::new();
+    repo.write("source.rs", "original\n");
+    let reference = repo.commit();
+    let first = repo.staged(false);
+    let raw = fs::read(repo.path().join(".git/index")).unwrap();
+    repo.git(&["config", "oss-provenance.policy-ref", &reference]);
+    let second = repo.staged(false);
+    assert_eq!(fs::read(repo.path().join(".git/index")).unwrap(), raw);
+    assert_eq!(
+        first.staged_identity().unwrap(),
+        second.staged_identity().unwrap()
+    );
+    assert_ne!(
+        IndexSession::application_identity(&first, &first, &reference).unwrap(),
+        IndexSession::application_identity(&second, &second, &reference).unwrap()
+    );
+}
+
+#[test]
+fn completion_receipts_survive_later_applications_without_reinstalling() {
+    use oss_provenance::git::CompletedApplication;
+    let repo = Repo::new();
+    repo.write("source.rs", "original\n");
+    let reference = repo.commit();
+    let session = IndexSession::open(repo.path()).unwrap();
+    let original = repo.staged(false);
+    let candidate = original
+        .overlay(&BTreeMap::from([(
+            "source.rs".into(),
+            b"replacement\n".to_vec(),
+        )]))
+        .unwrap();
+    let id = IndexSession::application_identity(&original, &candidate, &reference).unwrap();
+    session.apply(&original, &candidate, &reference).unwrap();
+    let receipt = session.state_dir.join(format!("applied-{id}.json"));
+    let receipt_bytes = fs::read(&receipt).unwrap();
+    let current = repo.staged(false);
+    session.apply(&current, &current, &reference).unwrap();
+    assert_eq!(
+        session
+            .completed_application(&id, &repo.staged(false))
+            .unwrap(),
+        Some(CompletedApplication::SameIndex)
+    );
+    assert_eq!(
+        session.recover_application(&id).unwrap(),
+        Some(ApplicationStatus::Applied)
+    );
+    repo.git(&["commit", "-m", "commit replacement"]);
+    assert_eq!(
+        session
+            .completed_application(&id, &repo.staged(false))
+            .unwrap(),
+        Some(CompletedApplication::SameIndex)
+    );
+    let raw = fs::read(&session.index_path).unwrap();
+    assert!(session.recover_application(&id).is_err());
+    assert_eq!(fs::read(&session.index_path).unwrap(), raw);
+    repo.write("source.rs", "new job\n");
+    repo.git(&["add", "source.rs"]);
+    repo.git(&["config", "oss-provenance.policy-ref", "new-policy"]);
+    assert_eq!(
+        session
+            .completed_application(&id, &repo.staged(false))
+            .unwrap(),
+        Some(CompletedApplication::ChangedIndex)
+    );
+    assert_eq!(fs::read(receipt).unwrap(), receipt_bytes);
+}
+
+#[test]
+fn immutable_history_rejects_collisions_and_symlinks() {
+    use oss_provenance::git::durable_write_once;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history");
+    durable_write_once(&path, b"saved").unwrap();
+    durable_write_once(&path, b"saved").unwrap();
+    assert!(durable_write_once(&path, b"different").is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"saved");
+    let link = directory.path().join("link");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(durable_write_once(&link, b"saved").is_err());
+}
+
+#[test]
 fn repository_root_preserves_a_trailing_newline_in_its_name() {
     let repo = Repo(tempfile::Builder::new().suffix("\n").tempdir().unwrap());
     repo.git(&["init", "-q"]);
@@ -64,7 +150,13 @@ fn application_rejects_changed_admission_and_completed_reversion() {
         ApplicationStatus::Applied
     );
     fs::write(&session.index_path, &raw).unwrap();
-    assert!(session.recover_repair().is_err());
+    assert!(
+        session
+            .recover_application(
+                &IndexSession::application_identity(&before, &candidate, &reference).unwrap()
+            )
+            .is_err()
+    );
     assert_eq!(fs::read(&session.index_path).unwrap(), raw);
 }
 
@@ -582,10 +674,15 @@ fn pending_installation_is_discovered_by_stable_index_identity() {
     fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
     fs::write(&session.index_path, raw).unwrap();
     let state_dir = session.state_dir.clone();
+    let application_id =
+        IndexSession::application_identity(&before, &candidate, &reference).unwrap();
     drop(session);
     let resumed = IndexSession::open(repo.path()).unwrap();
     assert_eq!(resumed.state_dir, state_dir);
-    assert_eq!(resumed.recover().unwrap(), Some(ApplicationStatus::Applied));
+    assert_eq!(
+        resumed.recover_application(&application_id).unwrap(),
+        Some(ApplicationStatus::Applied)
+    );
     assert_eq!(repo.git(&["show", ":source.rs"]), "replacement");
     journal["status"] = "prepared".into();
     fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
@@ -593,10 +690,33 @@ fn pending_installation_is_discovered_by_stable_index_identity() {
     repo.git(&["commit", "--allow-empty", "-m", "ref movement"]);
     fs::write(&resumed.index_path, installed).unwrap();
     assert_eq!(
-        resumed.recover().unwrap(),
+        resumed.recover_application(&application_id).unwrap(),
         Some(ApplicationStatus::InstalledButConflicted)
     );
     assert_eq!(repo.git(&["show", ":source.rs"]), "replacement");
+}
+
+#[test]
+fn recovery_cannot_accept_an_unrelated_application() {
+    let repo = Repo::new();
+    repo.write("source.rs", "original\n");
+    let reference = repo.commit();
+    let session = IndexSession::open(repo.path()).unwrap();
+    let original = repo.staged(false);
+    session.apply(&original, &original, &reference).unwrap();
+    let raw = fs::read(&session.index_path).unwrap();
+    let path = session.state_dir.join("application.json");
+    let mut journal: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let other = "0".repeat(64);
+    assert_eq!(session.recover_application(&other).unwrap(), None);
+    for status in ["prepared", "installed_but_conflicted"] {
+        journal["status"] = status.into();
+        let bytes = serde_json::to_vec(&journal).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(session.recover_application(&other).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read(&session.index_path).unwrap(), raw);
+    }
 }
 
 #[test]

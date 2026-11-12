@@ -528,8 +528,14 @@ mod tests {
         let root = PathBuf::from(std::env::var_os("AI_CLEANROOM_TEST_ROOT").unwrap());
         let session = IndexSession::open(&root).unwrap();
         if std::env::var_os("AI_CLEANROOM_TEST_RECOVER").is_some() {
+            let journal: ApplicationJournal = serde_json::from_slice(
+                &fs::read(session.state_dir.join("application.json")).unwrap(),
+            )
+            .unwrap();
             assert_eq!(
-                session.recover_repair().unwrap(),
+                session
+                    .recover_application(&journal.application_id)
+                    .unwrap(),
                 Some(ApplicationStatus::Applied)
             );
         } else {
@@ -606,6 +612,26 @@ pub fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub fn durable_write_once(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("durable file has no parent")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    if let Err(error) = temporary.persist_noclobber(path) {
+        ensure!(
+            error.error.kind() == std::io::ErrorKind::AlreadyExists,
+            "could not preserve immutable state: {}",
+            error.error
+        );
+        ensure!(
+            read_index(path)?.as_deref() == Some(bytes),
+            "immutable state differs from previously saved bytes"
+        );
+    }
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplicationStatus {
@@ -614,10 +640,18 @@ pub enum ApplicationStatus {
     InstalledButConflicted,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletedApplication {
+    SameIndex,
+    ChangedIndex,
+    AdmissionConflict,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ApplicationJournal {
     version: u8,
+    application_id: String,
     status: ApplicationStatus,
     index_path: PathBuf,
     before_raw: Option<String>,
@@ -739,28 +773,99 @@ impl IndexSession {
     }
 
     pub fn recover(&self) -> Result<Option<ApplicationStatus>> {
-        self.recover_journal(false)
+        self.recover_journal(None)
     }
 
-    pub fn recover_repair(&self) -> Result<Option<ApplicationStatus>> {
-        self.recover_journal(true)
+    pub fn recover_application(&self, expected_id: &str) -> Result<Option<ApplicationStatus>> {
+        self.recover_journal(Some(expected_id))
     }
 
-    fn recover_journal(&self, include_completed: bool) -> Result<Option<ApplicationStatus>> {
-        let path = self.state_dir.join("application.json");
+    fn read_journal(&self, path: &Path) -> Result<Option<ApplicationJournal>> {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = read_index(&path)?.context("application journal disappeared")?;
-        let mut journal: ApplicationJournal =
+        let bytes = read_index(path)?.context("application journal disappeared")?;
+        let journal: ApplicationJournal =
             serde_json::from_slice(&bytes).context("invalid application journal")?;
         ensure!(
             journal.version == 1 && journal.index_path == self.index_path,
             "application journal identity mismatch"
         );
-        if journal.status == ApplicationStatus::Applied && !include_completed {
+        Ok(Some(journal))
+    }
+
+    fn receipt_path(&self, id: &str) -> Result<PathBuf> {
+        ensure!(
+            id.len() == 64
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "invalid application identity"
+        );
+        Ok(self.state_dir.join(format!("applied-{id}.json")))
+    }
+
+    fn receipt(&self, id: &str) -> Result<Option<ApplicationJournal>> {
+        let receipt = self.read_journal(&self.receipt_path(id)?)?;
+        if let Some(receipt) = &receipt {
+            ensure!(
+                receipt.application_id == id && receipt.status == ApplicationStatus::Applied,
+                "completed application receipt identity or status mismatch"
+            );
+        }
+        Ok(receipt)
+    }
+
+    pub fn completed_application(
+        &self,
+        id: &str,
+        current: &Snapshot,
+    ) -> Result<Option<CompletedApplication>> {
+        let Some(receipt) = self.receipt(id)? else {
+            return Ok(None);
+        };
+        ensure!(
+            current.root == self.root,
+            "snapshot belongs to a different worktree"
+        );
+        let result = if logical_digest(&current.files) != receipt.after_logical {
+            CompletedApplication::ChangedIndex
+        } else if current
+            .captured_admitted_config
+            .as_ref()
+            .context("missing staged admission identity")?
+            != &receipt.admitted_config
+        {
+            CompletedApplication::AdmissionConflict
+        } else {
+            CompletedApplication::SameIndex
+        };
+        current.verify_unchanged()?;
+        Ok(Some(result))
+    }
+
+    fn recover_journal(&self, expected_id: Option<&str>) -> Result<Option<ApplicationStatus>> {
+        let mut journal = self.read_journal(&self.state_dir.join("application.json"))?;
+        if let Some(id) = expected_id
+            && journal.as_ref().is_none_or(|journal| {
+                journal.status == ApplicationStatus::Applied && journal.application_id != id
+            })
+            && let Some(receipt) = self.receipt(id)?
+        {
+            journal = Some(receipt);
+        }
+        let Some(mut journal) = journal else {
+            return Ok(None);
+        };
+        if journal.status == ApplicationStatus::Applied
+            && expected_id != Some(&journal.application_id)
+        {
             return Ok(None);
         }
+        ensure!(
+            expected_id.is_none_or(|id| id == journal.application_id),
+            "pending application belongs to a different transaction"
+        );
         if journal.status == ApplicationStatus::InstalledButConflicted {
             return Ok(Some(journal.status));
         }
@@ -842,6 +947,7 @@ impl IndexSession {
         let after = fs::read(&prepared)?;
         let mut journal = ApplicationJournal {
             version: 1,
+            application_id: Self::application_identity(original, candidate, policy_ref)?,
             status: ApplicationStatus::Prepared,
             index_path: self.index_path.clone(),
             before_raw: digest(before),
@@ -867,11 +973,28 @@ impl IndexSession {
         Ok(journal.status)
     }
 
+    pub fn application_identity(
+        original: &Snapshot,
+        candidate: &Snapshot,
+        policy_ref: &str,
+    ) -> Result<String> {
+        Ok(crate::policy::sha256(&serde_json::to_vec(&(
+            original.staged_identity()?,
+            logical_digest(&candidate.files),
+            policy_ref,
+            original
+                .captured_admitted_config
+                .as_ref()
+                .context("missing staged admission identity")?,
+        ))?))
+    }
+
     fn save_journal(&self, journal: &ApplicationJournal) -> Result<()> {
-        durable_write(
-            &self.state_dir.join("application.json"),
-            &serde_json::to_vec_pretty(journal)?,
-        )
+        let bytes = serde_json::to_vec_pretty(journal)?;
+        if journal.status == ApplicationStatus::Applied {
+            durable_write_once(&self.receipt_path(&journal.application_id)?, &bytes)?;
+        }
+        durable_write(&self.state_dir.join("application.json"), &bytes)
     }
 
     fn refs_match(&self, journal: &ApplicationJournal) -> Result<bool> {
